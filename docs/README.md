@@ -17,6 +17,24 @@ The idea is to use deno/bun embeddings to run expose functions that will handle 
 
 In that way, deno/bun run TypeScript, but it's limited to only the exposed functions. Without networking, filesystem, etc.
 
+```text
+TypeScript
+ ↓
+Rust
+ ↓
+MCP
+```
+
+```typescript
+import * as gdrive from './servers/google-drive';
+export async function saveSheetAsCsv(sheetId: string) {
+  const data = await gdrive.getSheet({ sheetId });
+  const csv = data.map(row => row.join(',')).join('\n');
+  await fs.writeFile(`./workspace/sheet-${sheetId}.csv`, csv);
+  return `./workspace/sheet-${sheetId}.csv`;
+}
+```
+
 ## Other Resources
 
 - https://deno.com/blog/roll-your-own-javascript-runtime
