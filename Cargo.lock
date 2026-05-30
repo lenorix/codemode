@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "code-execution-mcp"
+name = "codemode-mcp"
 version = "0.1.0"
