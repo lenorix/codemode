@@ -36,6 +36,11 @@ export async function saveSheetAsCsv(sheetId: string) {
 }
 ```
 
+## Similar Work
+
+- https://github.com/0xPlaygrounds/rig/issues/1439
+- https://github.com/pydantic/monty
+
 ## Other Resources
 
 - https://deno.com/blog/roll-your-own-javascript-runtime
