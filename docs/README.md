@@ -46,3 +46,4 @@ export async function saveSheetAsCsv(sheetId: string) {
 - https://deno.com/blog/roll-your-own-javascript-runtime
 - https://gist.github.com/andelf/61574d03353998a7b16a358a6fd5a097
 - https://weeklyrust.substack.com/p/rust-is-eating-javascript
+- https://github.com/apollographql/rust-best-practices
