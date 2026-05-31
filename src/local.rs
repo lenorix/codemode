@@ -57,7 +57,10 @@ impl std::fmt::Debug for LocalTools {
 
 impl LocalTools {
     pub fn new(server: impl Into<String>) -> Self {
-        Self { server: server.into(), tools: Vec::new() }
+        Self {
+            server: server.into(),
+            tools: Vec::new(),
+        }
     }
 
     /// The virtual server name these tools are exposed under.
@@ -98,7 +101,10 @@ impl LocalTools {
             .into_iter()
             .map(|t| (t.info.name.clone(), t))
             .collect();
-        Rc::new(LocalToolSet { server: self.server, tools })
+        Rc::new(LocalToolSet {
+            server: self.server,
+            tools,
+        })
     }
 }
 
@@ -114,7 +120,10 @@ impl ToolSource for LocalToolSet {
 
     fn servers(self: Rc<Self>) -> LocalFuture<Result<Vec<ServerInfo>>> {
         Box::pin(async move {
-            Ok(vec![ServerInfo { name: self.server.clone(), description: None }])
+            Ok(vec![ServerInfo {
+                name: self.server.clone(),
+                description: None,
+            }])
         })
     }
 
@@ -127,7 +136,12 @@ impl ToolSource for LocalToolSet {
         })
     }
 
-    fn call(self: Rc<Self>, server: String, tool: String, args: Value) -> LocalFuture<Result<Value>> {
+    fn call(
+        self: Rc<Self>,
+        server: String,
+        tool: String,
+        args: Value,
+    ) -> LocalFuture<Result<Value>> {
         Box::pin(async move {
             if server != self.server {
                 return Err(Error::UnknownServer(server));
@@ -180,14 +194,23 @@ impl ToolSource for CompositeSource {
 
     fn tools(self: Rc<Self>, server: String) -> LocalFuture<Result<Vec<ToolInfo>>> {
         Box::pin(async move {
-            let source = self.route(&server).ok_or_else(|| Error::UnknownServer(server.clone()))?;
+            let source = self
+                .route(&server)
+                .ok_or_else(|| Error::UnknownServer(server.clone()))?;
             source.tools(server).await
         })
     }
 
-    fn call(self: Rc<Self>, server: String, tool: String, args: Value) -> LocalFuture<Result<Value>> {
+    fn call(
+        self: Rc<Self>,
+        server: String,
+        tool: String,
+        args: Value,
+    ) -> LocalFuture<Result<Value>> {
         Box::pin(async move {
-            let source = self.route(&server).ok_or_else(|| Error::UnknownServer(server.clone()))?;
+            let source = self
+                .route(&server)
+                .ok_or_else(|| Error::UnknownServer(server.clone()))?;
             source.call(server, tool, args).await
         })
     }

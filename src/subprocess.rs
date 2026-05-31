@@ -1,7 +1,7 @@
 //! Optional subprocess isolation (Unix): run the model's code in a child process
-//! under OS resource limits (`RLIMIT_AS` for memory) plus a wall-clock kill, so a
-//! runaway script can't take down the host — the hard CPU/memory bound that an
-//! in-process engine can't give.
+//! under OS resource limits (`RLIMIT_AS` for memory, `RLIMIT_CPU`) plus a
+//! wall-clock kill, so a runaway script can't take down the host — the hard
+//! CPU/memory bound that an in-process engine can't give.
 //!
 //! `SubprocessRuntime` is just another [`CodeRuntime`]: instead of running Boa
 //! in-process, it spawns a worker (`codemode-mcp __worker`) that runs Boa. The
@@ -10,7 +10,11 @@
 //! [`Bridge`] the in-process engine would use. The bridge is pure data
 //! (`(server, tool, args) -> json`), which is exactly why it crosses the process
 //! boundary unchanged.
+//!
+//! The worker caps its own address space and CPU (see `run_worker`) using the
+//! safe `rlimit` wrapper, so there is no `unsafe` and no `pre_exec` here.
 
+use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::rc::Rc;
@@ -18,7 +22,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
@@ -27,14 +31,24 @@ use crate::runtime::{Bridge, BridgeError, CodeRuntime, RunRequest};
 use crate::source::LocalFuture;
 use crate::types::{Capabilities, ExecError, Limits, Outcome, ServerTools};
 
+/// Hard cap on a single protocol line. Payloads are already bounded by the
+/// run's `max_output_bytes` (results) and by the worker's `RLIMIT_AS` (the JS
+/// heap that builds tool-call arguments), but the *parent* is a separate process
+/// not covered by the worker's rlimit, so it bounds incoming lines explicitly to
+/// stop a giant tool-call argument from exhausting the parent's memory.
+const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
+
 // --- The wire protocol (one JSON object per line) ---
 
-/// The job the parent sends the worker (first line of the worker's stdin).
+/// The job the parent sends the worker (first line of the worker's stdin). The
+/// worker uses `max_memory_bytes` to cap its own address space (see `run_worker`),
+/// which is why the cap travels in the job rather than being applied by the parent.
 #[derive(Serialize, Deserialize)]
 struct Job {
     source: String,
     servers: Vec<ServerTools>,
     limits: WireLimits,
+    max_memory_bytes: u64,
 }
 
 /// `Limits` without `Duration` (which isn't plain serde), as milliseconds.
@@ -82,7 +96,11 @@ impl From<WireLimits> for Limits {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum FromWorker {
     /// A tool call the parent must service.
-    Call { server: String, tool: String, args: Value },
+    Call {
+        server: String,
+        tool: String,
+        args: Value,
+    },
     /// The final result.
     Done { outcome: Outcome },
 }
@@ -113,7 +131,10 @@ impl SubprocessRuntime {
 
     /// Use a specific binary as the worker.
     pub fn with_worker(worker: impl Into<PathBuf>) -> Self {
-        Self { worker: worker.into(), max_memory_bytes: 512 * 1024 * 1024 }
+        Self {
+            worker: worker.into(),
+            max_memory_bytes: 512 * 1024 * 1024,
+        }
     }
 
     /// Hard memory cap for the child (`RLIMIT_AS`, bytes). Default 512 MiB.
@@ -149,30 +170,31 @@ async fn run_parent(worker: PathBuf, max_memory_bytes: u64, request: RunRequest)
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
 
-    #[cfg(unix)]
-    {
-        let mem = max_memory_bytes;
-        // A coarse CPU-seconds cap as a second backstop to the wall-clock kill.
-        let cpu_seconds = request.limits.timeout.as_secs().max(1) + 2;
-        // Safety: only async-signal-safe calls (setrlimit) run between fork and exec.
-        unsafe {
-            command.pre_exec(move || set_resource_limits(mem, cpu_seconds));
-        }
-    }
-
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => return failed(format!("could not spawn worker: {e}")),
     };
-    let mut stdin = child.stdin.take().expect("piped stdin");
-    let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout")).lines();
+    let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        let _ = child.kill().await;
+        return failed("worker stdio was not piped".to_string());
+    };
+    let mut stdin = stdin;
+    let mut stdout = BufReader::new(stdout);
 
     let job = Job {
         source: request.source,
         servers: request.servers,
         limits: WireLimits::from(&request.limits),
+        max_memory_bytes,
     };
-    if let Err(e) = write_line(&mut stdin, &serde_json::to_string(&job).unwrap()).await {
+    let job_line = match serde_json::to_string(&job) {
+        Ok(line) => line,
+        Err(e) => {
+            let _ = child.kill().await;
+            return failed(format!("could not encode job: {e}"));
+        }
+    };
+    if let Err(e) = write_line(&mut stdin, &job_line).await {
         let _ = child.kill().await;
         return failed(format!("could not send job to worker: {e}"));
     }
@@ -197,16 +219,18 @@ async fn run_parent(worker: PathBuf, max_memory_bytes: u64, request: RunRequest)
 /// Service the worker's tool calls until it reports a result, or it exits early
 /// (e.g. killed by a resource limit).
 async fn pump(
-    stdout: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stdout: &mut BufReader<tokio::process::ChildStdout>,
     stdin: &mut tokio::process::ChildStdin,
     bridge: &Bridge,
 ) -> Result<Outcome, String> {
     loop {
-        let line = match stdout.next_line().await {
+        let line = match read_line_capped(stdout, MAX_LINE_BYTES).await {
             Ok(Some(line)) => line,
             Ok(None) => {
-                return Err("worker exited before producing a result (killed by a resource limit?)"
-                    .to_string());
+                return Err(
+                    "worker exited before producing a result (killed by a resource limit?)"
+                        .to_string(),
+                );
             }
             Err(e) => return Err(format!("reading from worker: {e}")),
         };
@@ -215,9 +239,12 @@ async fn pump(
             FromWorker::Call { server, tool, args } => {
                 let reply = match bridge(server, tool, args).await {
                     Ok(value) => ToWorker::Ok { value },
-                    Err(e) => ToWorker::Err { message: e.to_string() },
+                    Err(e) => ToWorker::Err {
+                        message: e.to_string(),
+                    },
                 };
-                write_line(stdin, &serde_json::to_string(&reply).unwrap())
+                let line = serde_json::to_string(&reply).map_err(|e| e.to_string())?;
+                write_line(stdin, &line)
                     .await
                     .map_err(|e| format!("writing to worker: {e}"))?;
             }
@@ -235,25 +262,52 @@ async fn write_line<W: AsyncWriteExt + Unpin>(writer: &mut W, line: &str) -> std
     writer.flush().await
 }
 
-#[cfg(unix)]
-fn set_resource_limits(max_memory_bytes: u64, cpu_seconds: u64) -> std::io::Result<()> {
-    // Best-effort: some platforms (notably macOS) don't honour RLIMIT_AS, and we
-    // must not fail the spawn over it — the parent's wall-clock kill is the
-    // cross-platform backstop. On Linux these are real hard caps.
-    let mem = libc::rlimit {
-        rlim_cur: max_memory_bytes as libc::rlim_t,
-        rlim_max: max_memory_bytes as libc::rlim_t,
-    };
-    let cpu = libc::rlimit {
-        rlim_cur: cpu_seconds as libc::rlim_t,
-        rlim_max: (cpu_seconds + 1) as libc::rlim_t,
-    };
-    // Safety: setrlimit is async-signal-safe; we deliberately ignore failures.
-    unsafe {
-        libc::setrlimit(libc::RLIMIT_AS, &mem);
-        libc::setrlimit(libc::RLIMIT_CPU, &cpu);
+/// Read one `\n`-delimited line, failing if it exceeds `max` bytes so a peer
+/// can't force unbounded allocation. Returns `Ok(None)` at EOF with no data.
+async fn read_line_capped<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> io::Result<Option<String>> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            return if buf.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+            };
+        }
+        if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            buf.extend_from_slice(&chunk[..pos]);
+            reader.consume(pos + 1);
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        let consumed = chunk.len();
+        buf.extend_from_slice(chunk);
+        reader.consume(consumed);
+        if buf.len() > max {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "protocol line exceeds maximum length",
+            ));
+        }
     }
-    Ok(())
+}
+
+/// Apply the child's own resource limits. Best-effort and deliberately ignoring
+/// failures: the parent's wall-clock kill is the cross-platform backstop.
+/// `RLIMIT_AS` is a real hard cap on Linux; other Unixes don't honour it (and
+/// `rlimit` doesn't expose it there), so only CPU is set off Linux. This mirrors
+/// `capabilities().hard_memory_cap` being Linux-only.
+#[cfg(unix)]
+fn apply_resource_limits(max_memory_bytes: u64, cpu_seconds: u64) {
+    use rlimit::{Resource, setrlimit};
+    let _ = setrlimit(Resource::CPU, cpu_seconds, cpu_seconds.saturating_add(1));
+    #[cfg(target_os = "linux")]
+    let _ = setrlimit(Resource::AS, max_memory_bytes, max_memory_bytes);
+    #[cfg(not(target_os = "linux"))]
+    let _ = max_memory_bytes;
 }
 
 // --- Worker side (the child process) ---
@@ -263,20 +317,31 @@ struct WorkerIo {
     stdout: tokio::io::Stdout,
 }
 
-/// Entry point for the `__worker` subcommand. Reads one `Job`, runs Boa with a
-/// bridge that proxies tool calls back to the parent, and writes the `Outcome`.
+/// Entry point for the `__worker` subcommand. Reads one `Job`, caps its own
+/// resources, runs Boa with a bridge that proxies tool calls back to the parent,
+/// and writes the `Outcome`.
 pub async fn run_worker() {
     let mut reader = BufReader::new(tokio::io::stdin());
-    let mut line = String::new();
-    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
-        return; // no job
-    }
-    let job: Job = match serde_json::from_str(line.trim()) {
-        Ok(job) => job,
-        Err(_) => return,
+    let job: Job = match read_line_capped(&mut reader, MAX_LINE_BYTES).await {
+        Ok(Some(line)) => match serde_json::from_str(line.trim()) {
+            Ok(job) => job,
+            Err(_) => return,
+        },
+        _ => return, // no job, or oversized/unreadable line
     };
 
-    let io = Rc::new(Mutex::new(WorkerIo { reader, stdout: tokio::io::stdout() }));
+    // Cap our own address space and CPU before running untrusted code. The CPU
+    // cap is a coarse backstop just past the run's wall-clock timeout.
+    #[cfg(unix)]
+    apply_resource_limits(
+        job.max_memory_bytes,
+        (job.limits.timeout_ms / 1000).max(1) + 2,
+    );
+
+    let io = Rc::new(Mutex::new(WorkerIo {
+        reader,
+        stdout: tokio::io::stdout(),
+    }));
     let bridge = remote_bridge(io.clone());
 
     let outcome = Boa::new()
@@ -289,8 +354,9 @@ pub async fn run_worker() {
         .await;
 
     let mut io = io.lock().await;
-    let line = serde_json::to_string(&FromWorker::Done { outcome }).unwrap();
-    let _ = write_line(&mut io.stdout, &line).await;
+    if let Ok(line) = serde_json::to_string(&FromWorker::Done { outcome }) {
+        let _ = write_line(&mut io.stdout, &line).await;
+    }
 }
 
 /// A bridge that turns each tool call into a round-trip with the parent. Calls
@@ -300,14 +366,22 @@ fn remote_bridge(io: Rc<Mutex<WorkerIo>>) -> Bridge {
         let io = io.clone();
         Box::pin(async move {
             let mut io = io.lock().await;
-            let call = serde_json::to_string(&FromWorker::Call { server, tool, args }).unwrap();
-            write_line(&mut io.stdout, &call).await.map_err(|e| BridgeError::Call(e.to_string()))?;
+            let call = serde_json::to_string(&FromWorker::Call { server, tool, args })
+                .map_err(|e| BridgeError::Call(e.to_string()))?;
+            write_line(&mut io.stdout, &call)
+                .await
+                .map_err(|e| BridgeError::Call(e.to_string()))?;
 
-            let mut line = String::new();
             let WorkerIo { reader, .. } = &mut *io;
-            if reader.read_line(&mut line).await.map_err(|e| BridgeError::Call(e.to_string()))? == 0 {
-                return Err(BridgeError::Call("parent closed the connection".to_string()));
-            }
+            let line = match read_line_capped(reader, MAX_LINE_BYTES).await {
+                Ok(Some(line)) => line,
+                Ok(None) => {
+                    return Err(BridgeError::Call(
+                        "parent closed the connection".to_string(),
+                    ));
+                }
+                Err(e) => return Err(BridgeError::Call(e.to_string())),
+            };
             match serde_json::from_str::<ToWorker>(line.trim())
                 .map_err(|e| BridgeError::Call(e.to_string()))?
             {

@@ -29,8 +29,10 @@ toml = "0.8"
 clap = { version = "4", features = ["derive"], optional = true }
 rig-core = { version = "0.37", optional = true, default-features = false }
 
+# rlimit gives a safe wrapper over setrlimit so the subprocess worker can cap its
+# own address space and CPU without any `unsafe` in our code.
 [target.'cfg(unix)'.dependencies]
-libc = { version = "0.2", optional = true }
+rlimit = { version = "0.10", optional = true }
 
 [features]
 default = ["cli"]
@@ -39,7 +41,7 @@ cli = ["dep:clap", "rmcp/server", "rmcp/transport-io"]
 # The adapter for embedding codemode in a Rig agent.
 rig = ["dep:rig-core"]
 # Run the model's code in a child process with OS resource limits (Unix).
-subprocess = ["dep:libc", "cli"]
+subprocess = ["dep:rlimit", "cli"]
 
 [[bin]]
 name = "codemode-mcp"

@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::DerefMut;
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
+use std::time::Duration;
 
 use futures_util::FutureExt;
 
@@ -64,8 +65,13 @@ impl CodeRuntime for Boa {
             // A fresh Context is built (and dropped) inside `run_inner`, so all of
             // this execution's JS heap and per-run state is released when it
             // returns — nothing accumulates or leaks across runs.
-            let (result, logs) =
-                run_inner(&request.source, &request.servers, request.bridge, &request.limits).await;
+            let (result, logs) = run_inner(
+                &request.source,
+                &request.servers,
+                request.bridge,
+                &request.limits,
+            )
+            .await;
             match result {
                 Ok(value) => Outcome::ok(value, logs),
                 Err(err) => Outcome::failed(err, logs),
@@ -139,7 +145,10 @@ async fn run_inner(
         // engine state can't leak. (The robust fix is subprocess isolation; see docs.)
         let eval = AssertUnwindSafe(async {
             let promise = module.load_link_evaluate(&mut context);
-            queue.clone().run_jobs_async(&RefCell::new(&mut context)).await?;
+            queue
+                .clone()
+                .run_jobs_async(&RefCell::new(&mut context))
+                .await?;
             Ok::<_, JsError>(promise)
         })
         .catch_unwind();
@@ -148,8 +157,9 @@ async fn run_inner(
             Err(_) => return Err(ExecError::Timeout),
             Ok(Err(_panic)) => {
                 return Err(ExecError::Limit {
-                    what: "execution aborted: a runtime limit (loop, recursion or stack) was exceeded"
-                        .to_string(),
+                    what:
+                        "execution aborted: a runtime limit (loop, recursion or stack) was exceeded"
+                            .to_string(),
                 });
             }
             Ok(Ok(Err(err))) => return Err(classify(err.to_string())),
@@ -175,8 +185,10 @@ async fn run_inner(
                             .to_string(),
                     });
                 }
-                let value =
-                    default.to_json(&mut context).map_err(js)?.unwrap_or(serde_json::Value::Null);
+                let value = default
+                    .to_json(&mut context)
+                    .map_err(js)?
+                    .unwrap_or(serde_json::Value::Null);
                 check_output_size(&value, limits.max_output_bytes)?;
                 Ok(value)
             }
@@ -204,7 +216,9 @@ async fn run_inner(
 }
 
 fn js(err: impl ToString) -> ExecError {
-    ExecError::Js { message: err.to_string() }
+    ExecError::Js {
+        message: err.to_string(),
+    }
 }
 
 /// Bound the serialized result without buffering it whole.
@@ -263,13 +277,25 @@ fn log(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsV
     if remaining == 0 {
         return Ok(JsValue::undefined());
     }
-    if js.len() > remaining {
-        state.log_budget.set(0);
-        state.logs.borrow_mut().push("[logs truncated]".to_string());
+    // `js.len()` is UTF-16 code units, which is a lower bound on the UTF-8 byte
+    // length (each code unit is at least one byte), so a giant string is rejected
+    // before we ever copy it into Rust. The budget is in bytes, so once we know
+    // it's within bounds by that lower bound we account by the exact byte length.
+    let truncated = if js.len() > remaining {
+        true
     } else {
         let line = js.to_std_string_escaped();
-        state.log_budget.set(remaining.saturating_sub(line.len()));
-        state.logs.borrow_mut().push(line);
+        if line.len() > remaining {
+            true
+        } else {
+            state.log_budget.set(remaining - line.len());
+            state.logs.borrow_mut().push(line);
+            false
+        }
+    };
+    if truncated {
+        state.log_budget.set(0);
+        state.logs.borrow_mut().push("[logs truncated]".to_string());
     }
     Ok(JsValue::undefined())
 }
@@ -291,11 +317,13 @@ fn bridge_call(
     };
 
     async move {
-        let bridge = bridge.ok_or_else(|| JsNativeError::typ().with_message("bridge unavailable"))?;
+        let bridge =
+            bridge.ok_or_else(|| JsNativeError::typ().with_message("bridge unavailable"))?;
         // Args arrive JSON-stringified (the generated wrappers do this); parse in
         // Rust. A non-JSON argument is a clear error, not a silent null.
-        let value: serde_json::Value = serde_json::from_str(&args_json)
-            .map_err(|_| JsNativeError::typ().with_message("tool arguments must be a JSON string"))?;
+        let value: serde_json::Value = serde_json::from_str(&args_json).map_err(|_| {
+            JsNativeError::typ().with_message("tool arguments must be a JSON string")
+        })?;
         match bridge(server, tool, value).await {
             Ok(result) => {
                 let mut ctx = context.borrow_mut();
@@ -339,7 +367,11 @@ impl ModuleLoader for ServerModuleLoader {
     ) -> JsResult<Module> {
         let spec = specifier.to_std_string_escaped();
         match self.sources.get(&spec) {
-            Some(src) => Module::parse(Source::from_bytes(src.as_bytes()), None, &mut context.borrow_mut()),
+            Some(src) => Module::parse(
+                Source::from_bytes(src.as_bytes()),
+                None,
+                &mut context.borrow_mut(),
+            ),
             // Name the available servers and show the exact import shape, so a
             // wrong name or a missing `./servers/` prefix self-corrects.
             None => Err(JsNativeError::typ()
@@ -467,20 +499,53 @@ impl JobExecutor for Queue {
                 group.insert(job.call(context));
             }
 
-            let microtasks_pending = !self.promise_jobs.borrow().is_empty()
-                || !self.timeout_jobs.borrow().is_empty()
-                || !self.generic_jobs.borrow().is_empty();
+            // Ready synchronous work (promise/generic jobs) should drain on the
+            // next iteration. A timeout job that isn't due yet is *not* ready: we
+            // must wait for its instant, not spin.
+            let has_ready_micro =
+                !self.promise_jobs.borrow().is_empty() || !self.generic_jobs.borrow().is_empty();
+            let next_timeout_ms = self
+                .timeout_jobs
+                .borrow()
+                .keys()
+                .next()
+                .map(|i| i.millis_since_epoch());
+            let has_async = !group.is_empty();
 
-            if group.is_empty() && !microtasks_pending {
+            if !has_ready_micro && !has_async && next_timeout_ms.is_none() {
                 return Ok(());
             }
-            if microtasks_pending {
+            if has_ready_micro {
                 // More synchronous work queued; loop to drain it.
                 tokio::task::yield_now().await;
-            } else if let Some(Err(err)) = group.next().await {
-                // Only async jobs (e.g. an in-flight tool call) remain: await one
-                // instead of busy-polling, so a waiting execution doesn't spin.
-                eprintln!("Uncaught {err}");
+                continue;
+            }
+            // Only async jobs and/or a future timer remain. Sleep until the
+            // nearest timer is due, or until an async job completes — whichever
+            // is first — instead of busy-polling, so a pending `setTimeout` can't
+            // peg the island's CPU (and starve other executions sharing it).
+            let sleep_ms = next_timeout_ms.map(|due| {
+                let now = context.borrow().clock().now().millis_since_epoch();
+                due.saturating_sub(now)
+            });
+            match (has_async, sleep_ms) {
+                (true, Some(ms)) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
+                        res = group.next() => {
+                            if let Some(Err(err)) = res {
+                                eprintln!("Uncaught {err}");
+                            }
+                        }
+                    }
+                }
+                (true, None) => {
+                    if let Some(Err(err)) = group.next().await {
+                        eprintln!("Uncaught {err}");
+                    }
+                }
+                (false, Some(ms)) => tokio::time::sleep(Duration::from_millis(ms)).await,
+                (false, None) => return Ok(()),
             }
         }
     }
@@ -511,8 +576,18 @@ mod tests {
         run_with(source, servers, bridge, Limits::default())
     }
 
-    fn run_with(source: &str, servers: Vec<ServerTools>, bridge: Bridge, limits: Limits) -> Outcome {
-        let request = RunRequest { source: source.to_string(), servers, bridge, limits };
+    fn run_with(
+        source: &str,
+        servers: Vec<ServerTools>,
+        bridge: Bridge,
+        limits: Limits,
+    ) -> Outcome {
+        let request = RunRequest {
+            source: source.to_string(),
+            servers,
+            bridge,
+            limits,
+        };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -524,6 +599,10 @@ mod tests {
         Rc::new(|_s, _t, args| Box::pin(async move { Ok(args) }))
     }
 
+    // The conformance suite (the cross-backend contract) runs as an integration
+    // test in `tests/conformance.rs`; the unit tests here cover Boa's own
+    // mechanics directly without depending on it.
+
     #[test]
     fn imports_and_calls_a_tool() {
         let bridge: Bridge = Rc::new(|_server, _tool, args| Box::pin(async move { Ok(args) }));
@@ -534,14 +613,22 @@ mod tests {
             demo_servers(),
             bridge,
         );
-        assert!(outcome.error.is_none(), "unexpected error: {:?}", outcome.error);
+        assert!(
+            outcome.error.is_none(),
+            "unexpected error: {:?}",
+            outcome.error
+        );
         assert_eq!(outcome.result, json!({ "hi": 1 }));
     }
 
     #[test]
     fn captures_console_log() {
         let bridge: Bridge = Rc::new(|_s, _t, args| Box::pin(async move { Ok(args) }));
-        let outcome = run("console.log('hello', 42); export default 1;", vec![], bridge);
+        let outcome = run(
+            "console.log('hello', 42); export default 1;",
+            vec![],
+            bridge,
+        );
         assert!(outcome.error.is_none());
         assert_eq!(outcome.logs, vec!["hello 42".to_string()]);
     }
@@ -583,7 +670,10 @@ mod tests {
         };
         // The message should guide the model back on track: name the available
         // servers so it can pick a real one rather than guess again.
-        assert!(message.contains("demo"), "should list available servers: {message}");
+        assert!(
+            message.contains("demo"),
+            "should list available servers: {message}"
+        );
     }
 
     #[test]
@@ -591,18 +681,29 @@ mod tests {
         // The most common LLM mistake: compute the answer but never `export
         // default` it. Returning a silent `null` gives the model nothing to fix,
         // so it retries blindly. A clear error names the fix.
-        let outcome = run("const answer = 41 + 1; console.log(answer);", vec![], echo_bridge());
+        let outcome = run(
+            "const answer = 41 + 1; console.log(answer);",
+            vec![],
+            echo_bridge(),
+        );
         let Some(ExecError::Js { message }) = outcome.error else {
             panic!("expected a Js error, got {:?}", outcome.error);
         };
-        assert!(message.contains("export default"), "should name the fix: {message}");
+        assert!(
+            message.contains("export default"),
+            "should name the fix: {message}"
+        );
     }
 
     #[test]
     fn explicit_null_export_is_allowed() {
         // `export default null` is a real answer, not the missing-export mistake.
         let outcome = run("export default null;", vec![], echo_bridge());
-        assert!(outcome.error.is_none(), "unexpected error: {:?}", outcome.error);
+        assert!(
+            outcome.error.is_none(),
+            "unexpected error: {:?}",
+            outcome.error
+        );
         assert_eq!(outcome.result, json!(null));
     }
 
@@ -644,8 +745,16 @@ mod tests {
     fn infinite_loop_is_caught_not_panicking() {
         // A runtime-limit hit during module evaluation makes Boa panic internally;
         // we must catch it and return a clean Limit error, keeping the island alive.
-        let limits = Limits { max_loop_iterations: 100_000, ..Limits::default() };
-        let outcome = run_with("while (true) {} export default 1;", vec![], echo_bridge(), limits);
+        let limits = Limits {
+            max_loop_iterations: 100_000,
+            ..Limits::default()
+        };
+        let outcome = run_with(
+            "while (true) {} export default 1;",
+            vec![],
+            echo_bridge(),
+            limits,
+        );
         assert!(
             matches!(outcome.error, Some(ExecError::Limit { .. })),
             "expected a Limit error, got {:?}",
@@ -658,7 +767,10 @@ mod tests {
 
     #[test]
     fn recursion_limit_trips() {
-        let limits = Limits { max_recursion_depth: 20, ..Limits::default() };
+        let limits = Limits {
+            max_recursion_depth: 20,
+            ..Limits::default()
+        };
         let outcome = run_with(
             "function r(n){ return n > 0 ? r(n - 1) + 1 : 0; } export default r(100);",
             vec![],
@@ -674,7 +786,10 @@ mod tests {
 
     #[test]
     fn rejects_oversized_result() {
-        let limits = Limits { max_output_bytes: 256, ..Limits::default() };
+        let limits = Limits {
+            max_output_bytes: 256,
+            ..Limits::default()
+        };
         let outcome = run_with(
             "export default 'x'.repeat(10000);",
             vec![],
@@ -686,7 +801,10 @@ mod tests {
 
     #[test]
     fn caps_log_output() {
-        let limits = Limits { max_output_bytes: 200, ..Limits::default() };
+        let limits = Limits {
+            max_output_bytes: 200,
+            ..Limits::default()
+        };
         let outcome = run_with(
             "for (let i = 0; i < 1000; i++) console.log('noisy log line number ' + i);\n\
              export default 'done';",
@@ -697,7 +815,10 @@ mod tests {
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
         let bytes: usize = outcome.logs.iter().map(|l| l.len()).sum();
         assert!(bytes <= 256, "logs not capped: {bytes} bytes");
-        assert_eq!(outcome.logs.last().map(String::as_str), Some("[logs truncated]"));
+        assert_eq!(
+            outcome.logs.last().map(String::as_str),
+            Some("[logs truncated]")
+        );
     }
 
     #[test]

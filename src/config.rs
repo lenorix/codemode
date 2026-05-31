@@ -91,7 +91,10 @@ impl Config {
                 allow: None,
             })
             .collect();
-        Ok(Config { servers, limits: Limits::default() })
+        Ok(Config {
+            servers,
+            limits: Limits::default(),
+        })
     }
 }
 
@@ -216,14 +219,20 @@ mod tests {
     #[test]
     fn from_mcp_json_exposes_all_tools_with_default_limits() {
         let path = std::env::temp_dir().join("codemode_from_mcp_json_test.json");
-        std::fs::write(&path, r#"{ "mcpServers": { "fs": { "command": "npx", "args": ["x"] } } }"#)
-            .unwrap();
+        std::fs::write(
+            &path,
+            r#"{ "mcpServers": { "fs": { "command": "npx", "args": ["x"] } } }"#,
+        )
+        .unwrap();
         let cfg = Config::from_mcp_json(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
         assert_eq!(cfg.servers.len(), 1);
         assert_eq!(cfg.servers[0].name, "fs");
-        assert!(cfg.servers[0].allow.is_none(), "mcp-json exposes all tools (no allowlist)");
+        assert!(
+            cfg.servers[0].allow.is_none(),
+            "mcp-json exposes all tools (no allowlist)"
+        );
         assert_eq!(cfg.limits.timeout, Limits::default().timeout);
     }
 

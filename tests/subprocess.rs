@@ -44,6 +44,15 @@ async fn runs_code_in_a_child_and_proxies_tool_calls() {
     cm.shutdown().await.unwrap();
 }
 
+// The same suite the in-process Boa backend passes, proving the seam holds
+// across a process boundary for a second, independent `CodeRuntime`.
+mod common;
+
+#[test]
+fn passes_the_conformance_suite() {
+    common::assert_js_conformant(worker());
+}
+
 #[tokio::test]
 async fn runaway_is_contained() {
     let cm = CodeMode::builder()
@@ -61,6 +70,9 @@ async fn runaway_is_contained() {
         .await
         .unwrap();
 
-    assert!(outcome.error.is_some(), "expected the runaway to be contained, got {outcome:?}");
+    assert!(
+        outcome.error.is_some(),
+        "expected the runaway to be contained, got {outcome:?}"
+    );
     cm.shutdown().await.unwrap();
 }

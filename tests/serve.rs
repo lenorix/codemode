@@ -19,15 +19,18 @@ fn serve_exposes_three_tools_and_executes_code() {
     tokio::task::LocalSet::new().block_on(&rt, async {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_codemode-mcp"));
         cmd.arg("serve");
-        let client = ()
-            .serve(TokioChildProcess::new(cmd).expect("spawn serve"))
-            .await
-            .expect("connect");
+        let client =
+            ().serve(TokioChildProcess::new(cmd).expect("spawn serve"))
+                .await
+                .expect("connect");
 
         let tools = client.list_all_tools().await.expect("list tools");
         let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
         for expected in ["discover", "find", "execute"] {
-            assert!(names.iter().any(|n| n == expected), "missing tool {expected}; got {names:?}");
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing tool {expected}; got {names:?}"
+            );
         }
 
         let result = client

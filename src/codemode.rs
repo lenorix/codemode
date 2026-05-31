@@ -5,11 +5,14 @@
 //! itself is `Send + Sync`.
 
 use std::cell::Cell;
+use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use serde_json::Value;
-use tokio::sync::{OnceCell, mpsc, oneshot};
+use tokio::sync::{OnceCell, Semaphore, mpsc, oneshot};
 
 use crate::boa::Boa;
 use crate::config::{Config, ServerConfig};
@@ -18,7 +21,12 @@ use crate::local::{CompositeSource, LocalTools};
 use crate::mcp::McpClient;
 use crate::runtime::{Bridge, BridgeError, CodeRuntime, RunRequest};
 use crate::source::{AllowList, ToolSource};
-use crate::types::{Capabilities, Limits, Outcome, ServerInfo, ServerTools, ToolInfo};
+use crate::types::{Capabilities, ExecError, Limits, Outcome, ServerInfo, ServerTools, ToolInfo};
+
+/// Default ceiling on executions running at once on the island. Each running
+/// execution holds a full JS context, so this bounds memory/CPU; further calls
+/// queue until a slot frees. Override with [`CodeModeBuilder::max_concurrent_executions`].
+const DEFAULT_MAX_CONCURRENT: usize = 16;
 
 /// Builds the `ToolSource` on the island thread (MCP connections are `!Send`).
 pub(crate) type SourceFactory = Box<dyn FnOnce() -> Rc<dyn ToolSource> + Send>;
@@ -39,7 +47,9 @@ pub struct CodeMode {
 
 impl std::fmt::Debug for CodeMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CodeMode").field("capabilities", &self.capabilities).finish_non_exhaustive()
+        f.debug_struct("CodeMode")
+            .field("capabilities", &self.capabilities)
+            .finish_non_exhaustive()
     }
 }
 
@@ -50,22 +60,28 @@ impl CodeMode {
     }
 
     /// Spawn the island. `runtime` and `factory` move onto the island thread.
+    /// Fails only if the OS refuses the island's runtime or thread.
     pub(crate) fn spawn(
         factory: SourceFactory,
         runtime: Box<dyn CodeRuntime + Send>,
         allow: AllowList,
         limits: Limits,
-    ) -> Self {
+        max_concurrent: usize,
+    ) -> Result<Self> {
         let capabilities = runtime.capabilities();
         let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
 
+        // Build the island's runtime here so a failure is returned to the caller
+        // rather than panicking the spawned thread.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| Error::Island(e.to_string()))?;
+
+        let max_concurrent = max_concurrent.max(1);
         let island = std::thread::Builder::new()
             .name("codemode-island".to_string())
             .spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("island runtime");
                 let local = tokio::task::LocalSet::new();
                 local.block_on(&rt, async move {
                     let source = factory();
@@ -76,9 +92,12 @@ impl CodeMode {
                     // OnceCell computes it once and single-flights it, so concurrent
                     // first executes don't each connect + list (racing the MCP cache).
                     let exposed = Rc::new(OnceCell::<Vec<ServerTools>>::new());
-                    // Executions run concurrently: each is its own task. Each gets a
-                    // fresh Boa context with its own state (see boa.rs), so they
-                    // never interfere. discover/find are cheap and run inline.
+                    // Bounds executions running at once: each holds a JS context, so
+                    // a flood of execute() calls queues instead of exhausting memory.
+                    let slots = Arc::new(Semaphore::new(max_concurrent));
+                    // Executions run concurrently: each is its own task with a fresh
+                    // context (see boa.rs), so they never interfere. discover/find
+                    // are cheap and run inline.
                     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
                     while let Some(command) = rx.recv().await {
                         match command {
@@ -90,18 +109,40 @@ impl CodeMode {
                             }
                             Command::Execute(code, reply) => {
                                 tasks.retain(|t| !t.is_finished());
-                                let (source, runtime, allow, limits, exposed) = (
+                                let (source, runtime, allow, limits, exposed, slots) = (
                                     source.clone(),
                                     runtime.clone(),
                                     allow.clone(),
                                     limits.clone(),
                                     exposed.clone(),
+                                    slots.clone(),
                                 );
                                 tasks.push(tokio::task::spawn_local(async move {
-                                    let out = execute(
-                                        &source, &allow, runtime.as_ref(), &limits, code, &exposed,
-                                    )
-                                    .await;
+                                    // Wait for a free slot, then run. A closed
+                                    // semaphore only happens at shutdown.
+                                    let Ok(_permit) = slots.acquire_owned().await else {
+                                        return;
+                                    };
+                                    // Catch a panic inside an execution so it becomes a
+                                    // failed Outcome instead of dropping the reply (which
+                                    // the caller would misread as a dead island).
+                                    let run = AssertUnwindSafe(execute(
+                                        &source,
+                                        &allow,
+                                        runtime.as_ref(),
+                                        &limits,
+                                        code,
+                                        &exposed,
+                                    ));
+                                    let out = run.catch_unwind().await.unwrap_or_else(|_| {
+                                        Outcome::failed(
+                                            ExecError::Js {
+                                                message: "internal error: execution panicked"
+                                                    .to_string(),
+                                            },
+                                            Vec::new(),
+                                        )
+                                    });
                                     let _ = reply.send(out);
                                 }));
                             }
@@ -122,9 +163,13 @@ impl CodeMode {
                     source.shutdown().await;
                 });
             })
-            .expect("spawn island thread");
+            .map_err(|e| Error::Island(e.to_string()))?;
 
-        Self { tx, capabilities, island: Some(island) }
+        Ok(Self {
+            tx,
+            capabilities,
+            island: Some(island),
+        })
     }
 
     /// The engine's capabilities (language, async support, hard memory cap) and
@@ -136,7 +181,9 @@ impl CodeMode {
     /// List the servers exposed to the model's code.
     pub async fn discover(&self) -> Result<Vec<ServerInfo>> {
         let (tx, rx) = oneshot::channel();
-        self.tx.send(Command::Discover(tx)).map_err(|_| Error::IslandGone)?;
+        self.tx
+            .send(Command::Discover(tx))
+            .map_err(|_| Error::IslandGone)?;
         rx.await.map_err(|_| Error::IslandGone)?
     }
 
@@ -164,7 +211,9 @@ impl CodeMode {
     /// join the island thread.
     pub async fn shutdown(mut self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.tx.send(Command::Shutdown(tx)).map_err(|_| Error::IslandGone)?;
+        self.tx
+            .send(Command::Shutdown(tx))
+            .map_err(|_| Error::IslandGone)?;
         let _ = rx.await;
         if let Some(handle) = self.island.take() {
             let _ = handle.join();
@@ -179,6 +228,7 @@ pub struct CodeModeBuilder {
     local: Vec<LocalTools>,
     runtime: Box<dyn CodeRuntime + Send>,
     limits: Limits,
+    max_concurrent: usize,
 }
 
 impl std::fmt::Debug for CodeModeBuilder {
@@ -197,7 +247,16 @@ impl CodeModeBuilder {
             local: Vec::new(),
             runtime: Box::new(Boa::new()),
             limits: Limits::default(),
+            max_concurrent: DEFAULT_MAX_CONCURRENT,
         }
+    }
+
+    /// Cap how many executions run at once on the island (default 16). Further
+    /// `execute` calls queue for a slot. Each running execution holds a JS
+    /// context, so this bounds memory under a flood of calls.
+    pub fn max_concurrent_executions(mut self, max: usize) -> Self {
+        self.max_concurrent = max;
+        self
     }
 
     /// Expose a group of in-Rust tools as a virtual server (see [`LocalTools`]).
@@ -263,7 +322,13 @@ impl CodeModeBuilder {
             }
             Rc::new(CompositeSource::new(sources)) as Rc<dyn ToolSource>
         });
-        Ok(CodeMode::spawn(factory, self.runtime, allow, self.limits))
+        CodeMode::spawn(
+            factory,
+            self.runtime,
+            allow,
+            self.limits,
+            self.max_concurrent,
+        )
     }
 }
 
@@ -275,7 +340,11 @@ async fn discover(source: &Rc<dyn ToolSource>, allow: &AllowList) -> Result<Vec<
         .collect())
 }
 
-async fn find(source: &Rc<dyn ToolSource>, allow: &AllowList, server: &str) -> Result<Vec<ToolInfo>> {
+async fn find(
+    source: &Rc<dyn ToolSource>,
+    allow: &AllowList,
+    server: &str,
+) -> Result<Vec<ToolInfo>> {
     if !allow.server_allowed(server) {
         return Err(Error::UnknownServer(server.to_string()));
     }
@@ -294,11 +363,16 @@ async fn execute(
     code: String,
     exposed: &OnceCell<Vec<ServerTools>>,
 ) -> Outcome {
-    let servers = match exposed.get_or_try_init(|| exposed_servers(source, allow)).await {
+    let servers = match exposed
+        .get_or_try_init(|| exposed_servers(source, allow))
+        .await
+    {
         Ok(servers) => servers.clone(),
         Err(e) => {
             return Outcome::failed(
-                crate::types::ExecError::Js { message: e.to_string() },
+                crate::types::ExecError::Js {
+                    message: e.to_string(),
+                },
                 Vec::new(),
             );
         }
@@ -311,12 +385,20 @@ async fn execute(
         limits.max_output_bytes,
     );
     runtime
-        .run(RunRequest { source: code, servers, bridge, limits: limits.clone() })
+        .run(RunRequest {
+            source: code,
+            servers,
+            bridge,
+            limits: limits.clone(),
+        })
         .await
 }
 
 /// Gather the exposed servers and their allowed tools, for module codegen.
-async fn exposed_servers(source: &Rc<dyn ToolSource>, allow: &AllowList) -> Result<Vec<ServerTools>> {
+async fn exposed_servers(
+    source: &Rc<dyn ToolSource>,
+    allow: &AllowList,
+) -> Result<Vec<ServerTools>> {
     let mut out = Vec::new();
     for server in source.clone().servers().await? {
         if !allow.server_allowed(&server.name) {
@@ -334,7 +416,10 @@ async fn exposed_servers(source: &Rc<dyn ToolSource>, allow: &AllowList) -> Resu
                 continue;
             }
         };
-        out.push(ServerTools { name: server.name, tools });
+        out.push(ServerTools {
+            name: server.name,
+            tools,
+        });
     }
     Ok(out)
 }
@@ -350,38 +435,48 @@ fn make_bridge(
     max_output_bytes: usize,
 ) -> Bridge {
     let budget = Rc::new(Cell::new(0u32));
-    Rc::new(move |server: String, tool: String, args: Value| -> crate::source::LocalFuture<std::result::Result<Value, BridgeError>> {
-        let source = source.clone();
-        let allow = allow.clone();
-        let budget = budget.clone();
-        Box::pin(async move {
-            if !allow.allows(&server, &tool) {
-                return Err(BridgeError::Denied { server, tool });
-            }
-            let used = budget.get();
-            if used >= max_calls {
-                return Err(BridgeError::BudgetExceeded);
-            }
-            budget.set(used + 1);
-
-            let result = match tokio::time::timeout(per_call, source.call(server, tool, args)).await {
-                // A local tool's own error message is intentional and safe to show.
-                Ok(Err(Error::Tool(message))) => return Err(BridgeError::Call(message)),
-                // MCP/spawn errors can carry paths or args; log the detail, surface a generic message.
-                Ok(Err(other)) => {
-                    eprintln!("codemode: tool call failed: {other}");
-                    return Err(BridgeError::Call("tool call failed".to_string()));
+    Rc::new(
+        move |server: String,
+              tool: String,
+              args: Value|
+              -> crate::source::LocalFuture<std::result::Result<Value, BridgeError>> {
+            let source = source.clone();
+            let allow = allow.clone();
+            let budget = budget.clone();
+            Box::pin(async move {
+                if !allow.allows(&server, &tool) {
+                    return Err(BridgeError::Denied { server, tool });
                 }
-                Err(_) => return Err(BridgeError::Call("tool call timed out".to_string())),
-                Ok(Ok(value)) => value,
-            };
+                let used = budget.get();
+                if used >= max_calls {
+                    return Err(BridgeError::BudgetExceeded);
+                }
+                budget.set(used + 1);
 
-            if !crate::types::serialized_within(&result, max_output_bytes) {
-                return Err(BridgeError::Call("tool result too large".to_string()));
-            }
-            Ok(result)
-        })
-    })
+                // On timeout the call future is dropped mid-flight. That is safe on a
+                // shared MCP connection: rmcp correlates responses by request id via a
+                // per-request oneshot, so a late response to the cancelled call is
+                // matched by id and discarded rather than desyncing the stream.
+                let result =
+                    match tokio::time::timeout(per_call, source.call(server, tool, args)).await {
+                        // A local tool's own error message is intentional and safe to show.
+                        Ok(Err(Error::Tool(message))) => return Err(BridgeError::Call(message)),
+                        // MCP/spawn errors can carry paths or args; log the detail, surface a generic message.
+                        Ok(Err(other)) => {
+                            eprintln!("codemode: tool call failed: {other}");
+                            return Err(BridgeError::Call("tool call failed".to_string()));
+                        }
+                        Err(_) => return Err(BridgeError::Call("tool call timed out".to_string())),
+                        Ok(Ok(value)) => value,
+                    };
+
+                if !crate::types::serialized_within(&result, max_output_bytes) {
+                    return Err(BridgeError::Call("tool result too large".to_string()));
+                }
+                Ok(result)
+            })
+        },
+    )
 }
 
 /// Shared test fixtures: an in-memory `FakeSource` factory used by these tests
@@ -412,12 +507,23 @@ pub(crate) mod test_support {
             tools.insert(
                 "demo".to_string(),
                 vec![
-                    ToolInfo { name: "echo".into(), description: None, input_schema: json!({}) },
-                    ToolInfo { name: "secret".into(), description: None, input_schema: json!({}) },
+                    ToolInfo {
+                        name: "echo".into(),
+                        description: None,
+                        input_schema: json!({}),
+                    },
+                    ToolInfo {
+                        name: "secret".into(),
+                        description: None,
+                        input_schema: json!({}),
+                    },
                 ],
             );
             Rc::new(FakeSource {
-                servers: vec![ServerInfo { name: "demo".into(), description: Some("Demo".into()) }],
+                servers: vec![ServerInfo {
+                    name: "demo".into(),
+                    description: Some("Demo".into()),
+                }],
                 tools,
                 responder: Box::new(|_server, tool, args| json!({ "tool": tool, "args": args })),
                 tools_calls,
@@ -432,12 +538,22 @@ pub(crate) mod test_support {
             let mut tools = HashMap::new();
             tools.insert(
                 "demo".to_string(),
-                vec![ToolInfo { name: "echo".into(), description: None, input_schema: json!({}) }],
+                vec![ToolInfo {
+                    name: "echo".into(),
+                    description: None,
+                    input_schema: json!({}),
+                }],
             );
             Rc::new(FakeSource {
                 servers: vec![
-                    ServerInfo { name: "demo".into(), description: None },
-                    ServerInfo { name: "broken".into(), description: None },
+                    ServerInfo {
+                        name: "demo".into(),
+                        description: None,
+                    },
+                    ServerInfo {
+                        name: "broken".into(),
+                        description: None,
+                    },
                 ],
                 tools,
                 responder: Box::new(|_server, tool, args| json!({ "tool": tool, "args": args })),
@@ -455,7 +571,14 @@ mod tests {
     use crate::boa::Boa;
 
     fn code_mode(allow: AllowList) -> CodeMode {
-        CodeMode::spawn(test_support::fake_factory(), Box::new(Boa::new()), allow, Limits::default())
+        CodeMode::spawn(
+            test_support::fake_factory(),
+            Box::new(Boa::new()),
+            allow,
+            Limits::default(),
+            DEFAULT_MAX_CONCURRENT,
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -471,14 +594,20 @@ mod tests {
             Box::new(Boa::new()),
             allow,
             Limits::default(),
-        );
+            DEFAULT_MAX_CONCURRENT,
+        )
+        .unwrap();
 
         let code = "import * as d from './servers/demo'; export default await d.echo({});";
         cm.execute(code).await.unwrap();
         cm.execute(code).await.unwrap();
         cm.shutdown().await.unwrap();
 
-        assert_eq!(counter.load(Ordering::Relaxed), 1, "tools() should be listed once then cached");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "tools() should be listed once then cached"
+        );
     }
 
     #[tokio::test]
@@ -514,7 +643,10 @@ mod tests {
             .unwrap();
 
         assert!(outcome.error.is_none(), "error: {:?}", outcome.error);
-        assert_eq!(outcome.result, json!({ "tool": "echo", "args": { "n": 7 } }));
+        assert_eq!(
+            outcome.result,
+            json!({ "tool": "echo", "args": { "n": 7 } })
+        );
         cm.shutdown().await.unwrap();
     }
 
@@ -563,7 +695,10 @@ mod tests {
 
         // `slow` was submitted first but takes longer; if the two executions run
         // concurrently, `fast` finishes first.
-        assert_eq!(*order.lock().unwrap(), vec!["fast".to_string(), "slow".to_string()]);
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["fast".to_string(), "slow".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -571,7 +706,10 @@ mod tests {
         use crate::LocalTools;
 
         let cm = CodeMode::builder()
-            .limits(Limits { per_call_timeout: Duration::from_millis(50), ..Limits::default() })
+            .limits(Limits {
+                per_call_timeout: Duration::from_millis(50),
+                ..Limits::default()
+            })
             .local_tools(LocalTools::new("slow").tool(
                 "wait",
                 "Sleeps forever",
@@ -589,7 +727,10 @@ mod tests {
             .execute("import * as s from './servers/slow'; export default await s.wait({});")
             .await
             .unwrap();
-        assert!(outcome.error.is_some(), "expected the hung tool call to surface an error");
+        assert!(
+            outcome.error.is_some(),
+            "expected the hung tool call to surface an error"
+        );
 
         // The island survived the timeout: a subsequent execution still works.
         let after = cm.execute("export default 1 + 1;").await.unwrap();
@@ -602,7 +743,10 @@ mod tests {
         use crate::LocalTools;
 
         let cm = CodeMode::builder()
-            .limits(Limits { max_output_bytes: 100, ..Limits::default() })
+            .limits(Limits {
+                max_output_bytes: 100,
+                ..Limits::default()
+            })
             .local_tools(LocalTools::new("big").tool(
                 "blob",
                 "Returns a large value",
@@ -617,7 +761,10 @@ mod tests {
             .execute("import * as b from './servers/big'; export default await b.blob({});")
             .await
             .unwrap();
-        assert!(outcome.error.is_some(), "oversized tool result should be rejected at the bridge");
+        assert!(
+            outcome.error.is_some(),
+            "oversized tool result should be rejected at the bridge"
+        );
         cm.shutdown().await.unwrap();
     }
 
@@ -626,7 +773,10 @@ mod tests {
         use crate::LocalTools;
 
         let cm = CodeMode::builder()
-            .limits(Limits { max_tool_calls: 2, ..Limits::default() })
+            .limits(Limits {
+                max_tool_calls: 2,
+                ..Limits::default()
+            })
             .local_tools(LocalTools::new("c").tool(
                 "ping",
                 "",
@@ -645,7 +795,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(outcome.error.is_some(), "the 3rd call should exceed the budget");
+        assert!(
+            outcome.error.is_some(),
+            "the 3rd call should exceed the budget"
+        );
         cm.shutdown().await.unwrap();
     }
 
@@ -691,13 +844,19 @@ mod tests {
             Box::new(Boa::new()),
             allow,
             Limits::default(),
-        );
+            DEFAULT_MAX_CONCURRENT,
+        )
+        .unwrap();
 
         let outcome = cm
             .execute("import * as d from './servers/demo'; export default await d.echo({});")
             .await
             .unwrap();
-        assert!(outcome.error.is_none(), "broken server should be skipped: {:?}", outcome.error);
+        assert!(
+            outcome.error.is_none(),
+            "broken server should be skipped: {:?}",
+            outcome.error
+        );
         assert_eq!(outcome.result, json!({ "tool": "echo", "args": {} }));
         cm.shutdown().await.unwrap();
     }

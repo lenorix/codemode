@@ -21,7 +21,12 @@ pub trait ToolSource {
 
     fn servers(self: Rc<Self>) -> LocalFuture<Result<Vec<ServerInfo>>>;
     fn tools(self: Rc<Self>, server: String) -> LocalFuture<Result<Vec<ToolInfo>>>;
-    fn call(self: Rc<Self>, server: String, tool: String, args: Value) -> LocalFuture<Result<Value>>;
+    fn call(
+        self: Rc<Self>,
+        server: String,
+        tool: String,
+        args: Value,
+    ) -> LocalFuture<Result<Value>>;
 
     /// Release resources (e.g. cancel MCP connections) while the tokio reactor
     /// is still alive. Called on the island before it winds down.
@@ -43,7 +48,11 @@ enum Allowed {
 }
 
 impl AllowList {
-    pub fn allow(&mut self, server: impl Into<String>, tools: impl IntoIterator<Item = impl Into<String>>) {
+    pub fn allow(
+        &mut self,
+        server: impl Into<String>,
+        tools: impl IntoIterator<Item = impl Into<String>>,
+    ) {
         let set = tools.into_iter().map(Into::into).collect();
         self.servers.insert(server.into(), Allowed::Only(set));
     }
@@ -92,7 +101,8 @@ pub(crate) mod fake {
         }
 
         fn tools(self: Rc<Self>, server: String) -> LocalFuture<Result<Vec<ToolInfo>>> {
-            self.tools_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.tools_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Box::pin(async move {
                 match self.tools.get(&server).cloned() {
                     Some(tools) => Ok(tools),
@@ -101,7 +111,12 @@ pub(crate) mod fake {
             })
         }
 
-        fn call(self: Rc<Self>, server: String, tool: String, args: Value) -> LocalFuture<Result<Value>> {
+        fn call(
+            self: Rc<Self>,
+            server: String,
+            tool: String,
+            args: Value,
+        ) -> LocalFuture<Result<Value>> {
             Box::pin(async move { Ok((self.responder)(&server, &tool, &args)) })
         }
     }

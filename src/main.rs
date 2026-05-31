@@ -13,19 +13,23 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use codemode_mcp::{CodeMode, Config};
+use rmcp::ErrorData;
 use rmcp::ServiceExt;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams,
     ServerCapabilities, ServerInfo, Tool,
 };
-use rmcp::ErrorData;
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::stdio;
 use serde_json::{Value, json};
 
 #[derive(Parser)]
-#[command(name = "codemode-mcp", version, about = "Run model-written code against MCP tools")]
+#[command(
+    name = "codemode-mcp",
+    version,
+    about = "Run model-written code against MCP tools"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -50,7 +54,13 @@ fn main() -> ExitCode {
     // isolation runtime (see src/subprocess.rs). It's not a user-facing command.
     #[cfg(feature = "subprocess")]
     if std::env::args().nth(1).as_deref() == Some("__worker") {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        let rt = match build_runtime() {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
+        };
         tokio::task::LocalSet::new().block_on(&rt, codemode_mcp::subprocess::run_worker());
         return ExitCode::SUCCESS;
     }
@@ -58,18 +68,32 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     // A current-thread runtime + LocalSet: the MCP server transport uses
     // `spawn_local` (rmcp's `local` feature), so it must run on a LocalSet.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
+    let rt = match build_runtime() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, run(cli))
+}
+
+fn build_runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))
 }
 
 async fn build_code_mode(config: Option<PathBuf>) -> Result<CodeMode, String> {
     let mut builder = CodeMode::builder();
     if let Some(path) = config {
-        if path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("json")) {
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+        {
             eprintln!(
                 "warning: a .mcp.json carries no allowlist, so all listed tools are exposed; \
                  use a servers.toml with `allow = [...]` to restrict."
@@ -223,7 +247,10 @@ impl ServerHandler for CodeModeServer {
                 serde_json::to_value(outcome).map_err(internal)?
             }
             other => {
-                return Err(ErrorData::invalid_params(format!("unknown tool '{other}'"), None));
+                return Err(ErrorData::invalid_params(
+                    format!("unknown tool '{other}'"),
+                    None,
+                ));
             }
         };
         Ok(CallToolResult::structured(value))

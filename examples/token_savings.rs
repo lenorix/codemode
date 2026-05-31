@@ -48,7 +48,9 @@ static CATALOG: LazyLock<Value> = LazyLock::new(|| {
 });
 
 fn products() -> &'static [Value] {
-    CATALOG["products"].as_array().expect("catalog has a products array")
+    CATALOG["products"]
+        .as_array()
+        .expect("catalog has a products array")
 }
 
 fn product(product_id: &str) -> Option<&'static Value> {
@@ -69,7 +71,9 @@ fn get_reviews(product_id: &str) -> Value {
     // This data re-enters the model's context on every turn of the traditional
     // run, but never does in code mode. Across products and the five tools, the
     // accumulated results are what dominate the traditional run's token bill.
-    product(product_id).map(|p| p["reviews"].clone()).unwrap_or_else(|| json!([]))
+    product(product_id)
+        .map(|p| p["reviews"].clone())
+        .unwrap_or_else(|| json!([]))
 }
 
 fn get_inventory(product_id: &str) -> Value {
@@ -99,7 +103,11 @@ const TASK: &str = "Produce a top-sellers report. Among products whose average r
 
 // --- Minimal OpenAI chat client ---
 
-async fn chat(client: &reqwest::Client, messages: &Value, tools: &Value) -> Result<(Value, u64), String> {
+async fn chat(
+    client: &reqwest::Client,
+    messages: &Value,
+    tools: &Value,
+) -> Result<(Value, u64), String> {
     let body = json!({
         // Thinking models (qwen, gpt-oss) emit a long reasoning trace before the
         // visible answer; too small a cap truncates mid-reasoning and the turn
@@ -107,16 +115,21 @@ async fn chat(client: &reqwest::Client, messages: &Value, tools: &Value) -> Resu
         "model": MODEL, "messages": messages, "tools": tools,
         "temperature": 0, "max_tokens": 8000
     });
-    let resp = client.post(ENDPOINT).json(&body).send().await.map_err(|e| {
-        let kind = if e.is_timeout() {
-            " (timed out)"
-        } else if e.is_connect() {
-            " (could not connect — is the LLM server running?)"
-        } else {
-            ""
-        };
-        format!("request to {ENDPOINT} failed{kind}: {e}")
-    })?;
+    let resp = client
+        .post(ENDPOINT)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            let kind = if e.is_timeout() {
+                " (timed out)"
+            } else if e.is_connect() {
+                " (could not connect — is the LLM server running?)"
+            } else {
+                ""
+            };
+            format!("request to {ENDPOINT} failed{kind}: {e}")
+        })?;
     let v: Value = resp.json().await.map_err(|e| e.to_string())?;
     let tokens = v["usage"]["total_tokens"].as_u64().unwrap_or(0);
     let message = v["choices"][0]["message"].clone();
@@ -186,16 +199,35 @@ where
         let (message, turn_tokens) = chat(client, &messages, &tools).await?;
         llm_time += started.elapsed();
         tokens += turn_tokens;
-        messages.as_array_mut().unwrap().push(history_entry(&message));
+        messages
+            .as_array_mut()
+            .unwrap()
+            .push(history_entry(&message));
 
-        let tool_calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
+        let tool_calls = message["tool_calls"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         if tool_calls.is_empty() {
-            let answer = message["content"].as_str().unwrap_or_default().trim().to_string();
-            return Ok(RunMetrics { answer, tokens, turns, llm_time, tool_time });
+            let answer = message["content"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            return Ok(RunMetrics {
+                answer,
+                tokens,
+                turns,
+                llm_time,
+                tool_time,
+            });
         }
 
         for call in tool_calls {
-            let name = call["function"]["name"].as_str().unwrap_or_default().to_string();
+            let name = call["function"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
             let args: Value =
                 serde_json::from_str(call["function"]["arguments"].as_str().unwrap_or("{}"))
                     .unwrap_or(json!({}));
@@ -209,7 +241,9 @@ where
             }));
         }
     }
-    Err(format!("did not finish within {MAX_TURNS} turns (tokens so far: {tokens})"))
+    Err(format!(
+        "did not finish within {MAX_TURNS} turns (tokens so far: {tokens})"
+    ))
 }
 
 async fn traditional(client: &reqwest::Client) -> Result<RunMetrics, String> {
@@ -399,7 +433,13 @@ async fn timed(
 }
 
 fn compare((trad, trad_time): &(RunMetrics, Duration), (cm, cm_time): &(RunMetrics, Duration)) {
-    let pct = |base: f64, now: f64| if base > 0.0 { (base - now) / base * 100.0 } else { 0.0 };
+    let pct = |base: f64, now: f64| {
+        if base > 0.0 {
+            (base - now) / base * 100.0
+        } else {
+            0.0
+        }
+    };
     println!("== Result (traditional -> code mode) ==");
     println!(
         "tokens:    {} -> {}  ({:.0}% fewer)",
@@ -407,7 +447,10 @@ fn compare((trad, trad_time): &(RunMetrics, Duration), (cm, cm_time): &(RunMetri
         cm.tokens,
         pct(trad.tokens as f64, cm.tokens as f64),
     );
-    println!("LLM turns: {} -> {}  (each turn is a network round-trip)", trad.turns, cm.turns);
+    println!(
+        "LLM turns: {} -> {}  (each turn is a network round-trip)",
+        trad.turns, cm.turns
+    );
     println!(
         "latency:   {:.1}s -> {:.1}s  ({:.0}% faster)",
         trad_time.as_secs_f64(),

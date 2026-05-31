@@ -36,7 +36,11 @@ async fn end_to_end_against_server_everything() {
         .await
         .expect("execute");
 
-    assert!(outcome.error.is_none(), "execution error: {:?}", outcome.error);
+    assert!(
+        outcome.error.is_none(),
+        "execution error: {:?}",
+        outcome.error
+    );
     let rendered = serde_json::to_string(&outcome.result).unwrap();
     assert!(
         rendered.contains("hi from codemode"),

@@ -57,15 +57,21 @@ cargo run --bin codemode-mcp -- tools --config servers.toml   # list the exposed
 cargo run --example token_savings # token usage: traditional vs. code mode (needs a local LLM)
 ```
 
-The `token_savings` example runs the same task both ways against a local OpenAI-compatible model
-and reports the tokens each consumed. A sample run (a 6-product "find the best-rated product" task
-against a local model) reached the same answer with far fewer tokens:
+The `token_savings` example runs the same task both ways against a local OpenAI-compatible model and
+reports, for each, the tokens, the number of LLM turns, and the wall-clock time. The task is a
+production-shaped report (a "top sellers among well-reviewed, in-stock products" query that chains
+five tools per product). A sample run reached the same answer both ways:
 
 ```
-traditional: 5900 tokens
-code mode:   2255 tokens
-saved:       3645 tokens (62% fewer)
+== Result (traditional -> code mode) ==
+tokens:    11950 -> 2649  (78% fewer)
+LLM turns: 6 -> 2  (each turn is a network round-trip)
+latency:   205.6s -> 87.9s  (57% faster)
 ```
+
+The win grows with the data: in traditional tool-calling every intermediate result re-enters the
+model's context and is re-tokenized each turn, while in code mode it stays in the sandbox and only
+the final answer returns.
 
 ## Docs
 

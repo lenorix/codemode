@@ -27,11 +27,20 @@ struct Launch {
 pub(crate) struct McpClient {
     launch: Vec<Launch>,
     connections: RefCell<HashMap<String, RunningService<RoleClient, ()>>>,
+    // Serializes the connect path so two concurrent first-uses of the same
+    // server don't each spawn a child process (the second would overwrite and
+    // orphan the first). Connects are rare (once per server), so one shared lock
+    // is enough and simpler than a per-server cell.
+    connect_lock: tokio::sync::Mutex<()>,
+    // Configured env values, redacted from every error string so a downstream
+    // spawn/transport error can't carry a credential — not to the model and not
+    // to the operator's stderr. See [`McpClient::scrub`].
+    secrets: Vec<String>,
 }
 
 impl McpClient {
     pub(crate) fn new(servers: &[ServerConfig]) -> Self {
-        let launch = servers
+        let launch: Vec<Launch> = servers
             .iter()
             .map(|s| Launch {
                 name: s.name.clone(),
@@ -40,11 +49,40 @@ impl McpClient {
                 env: s.env.clone(),
             })
             .collect();
-        Self { launch, connections: RefCell::new(HashMap::new()) }
+        // Only non-trivial values are worth redacting; very short ones would
+        // over-redact (e.g. an env value of "1" appearing incidentally).
+        let secrets = launch
+            .iter()
+            .flat_map(|l| l.env.iter().map(|(_, v)| v.clone()))
+            .filter(|v| v.len() >= 4)
+            .collect();
+        Self {
+            launch,
+            connections: RefCell::new(HashMap::new()),
+            connect_lock: tokio::sync::Mutex::new(()),
+            secrets,
+        }
+    }
+
+    /// Replace any configured secret value with `***`, so it never appears in an
+    /// error surfaced to the model or written to the operator's logs.
+    fn scrub(&self, mut message: String) -> String {
+        for secret in &self.secrets {
+            if message.contains(secret.as_str()) {
+                message = message.replace(secret.as_str(), "***");
+            }
+        }
+        message
     }
 
     /// A cloned `Peer` for `server`, connecting (and caching) on first use.
     async fn peer(&self, server: &str) -> Result<Peer<RoleClient>> {
+        if let Some(service) = self.connections.borrow().get(server) {
+            return Ok(service.peer().clone());
+        }
+        // Hold the connect lock and re-check: another task may have connected
+        // this server while we awaited the lock.
+        let _guard = self.connect_lock.lock().await;
         if let Some(service) = self.connections.borrow().get(server) {
             return Ok(service.peer().clone());
         }
@@ -59,14 +97,18 @@ impl McpClient {
         for (key, value) in &cfg.env {
             command.env(key, value);
         }
-        let transport = TokioChildProcess::new(command)
-            .map_err(|e| Error::Spawn { server: server.to_string(), message: e.to_string() })?;
-        let service = ()
-            .serve(transport)
-            .await
-            .map_err(|e| Error::Spawn { server: server.to_string(), message: e.to_string() })?;
+        let transport = TokioChildProcess::new(command).map_err(|e| Error::Spawn {
+            server: server.to_string(),
+            message: self.scrub(e.to_string()),
+        })?;
+        let service = ().serve(transport).await.map_err(|e| Error::Spawn {
+            server: server.to_string(),
+            message: self.scrub(e.to_string()),
+        })?;
         let peer = service.peer().clone();
-        self.connections.borrow_mut().insert(server.to_string(), service);
+        self.connections
+            .borrow_mut()
+            .insert(server.to_string(), service);
         Ok(peer)
     }
 }
@@ -81,7 +123,10 @@ impl ToolSource for McpClient {
             Ok(self
                 .launch
                 .iter()
-                .map(|l| ServerInfo { name: l.name.clone(), description: None })
+                .map(|l| ServerInfo {
+                    name: l.name.clone(),
+                    description: None,
+                })
                 .collect())
         })
     }
@@ -89,7 +134,10 @@ impl ToolSource for McpClient {
     fn tools(self: Rc<Self>, server: String) -> LocalFuture<Result<Vec<ToolInfo>>> {
         Box::pin(async move {
             let peer = self.peer(&server).await?;
-            let tools = peer.list_all_tools().await.map_err(|e| Error::Mcp(e.to_string()))?;
+            let tools = peer
+                .list_all_tools()
+                .await
+                .map_err(|e| Error::Mcp(self.scrub(e.to_string())))?;
             Ok(tools
                 .into_iter()
                 .map(|t| ToolInfo {
@@ -101,7 +149,12 @@ impl ToolSource for McpClient {
         })
     }
 
-    fn call(self: Rc<Self>, server: String, tool: String, args: Value) -> LocalFuture<Result<Value>> {
+    fn call(
+        self: Rc<Self>,
+        server: String,
+        tool: String,
+        args: Value,
+    ) -> LocalFuture<Result<Value>> {
         Box::pin(async move {
             let peer = self.peer(&server).await?;
             let arguments = match args {
@@ -109,7 +162,10 @@ impl ToolSource for McpClient {
                 _ => serde_json::Map::new(),
             };
             let params = CallToolRequestParams::new(tool).with_arguments(arguments);
-            let result = peer.call_tool(params).await.map_err(|e| Error::Mcp(e.to_string()))?;
+            let result = peer
+                .call_tool(params)
+                .await
+                .map_err(|e| Error::Mcp(self.scrub(e.to_string())))?;
             map_result(result)
         })
     }
@@ -153,7 +209,22 @@ mod tests {
     use rmcp::model::{CallToolResult, Content};
     use serde_json::json;
 
-    use super::map_result;
+    use super::{McpClient, map_result};
+    use crate::config::ServerConfig;
+
+    #[test]
+    fn scrubs_configured_secrets_from_errors() {
+        let server = ServerConfig::stdio("api", "run-server", ["--flag"])
+            .env("API_TOKEN", "super-secret-token-value");
+        let client = McpClient::new(&[server]);
+        let scrubbed = client
+            .scrub("spawn failed: API_TOKEN=super-secret-token-value not accepted".to_string());
+        assert!(
+            !scrubbed.contains("super-secret-token-value"),
+            "secret leaked: {scrubbed}"
+        );
+        assert!(scrubbed.contains("***"));
+    }
 
     #[test]
     fn prefers_structured_content() {

@@ -24,6 +24,9 @@ pub enum Error {
 
     #[error("the engine island stopped unexpectedly")]
     IslandGone,
+
+    #[error("could not start the engine island: {0}")]
+    Island(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

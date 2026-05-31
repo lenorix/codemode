@@ -153,7 +153,16 @@ mod tests {
     fn fake_code_mode() -> Arc<CodeMode> {
         let mut allow = AllowList::default();
         allow.allow("demo", ["echo"]);
-        Arc::new(CodeMode::spawn(fake_factory(), Box::new(Boa::new()), allow, Limits::default()))
+        Arc::new(
+            CodeMode::spawn(
+                fake_factory(),
+                Box::new(Boa::new()),
+                allow,
+                Limits::default(),
+                8,
+            )
+            .unwrap(),
+        )
     }
 
     #[tokio::test]
@@ -168,7 +177,10 @@ mod tests {
             .await
             .unwrap();
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
-        assert_eq!(outcome.result, json!({ "tool": "echo", "args": { "n": 3 } }));
+        assert_eq!(
+            outcome.result,
+            json!({ "tool": "echo", "args": { "n": 3 } })
+        );
     }
 
     #[tokio::test]

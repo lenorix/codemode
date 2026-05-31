@@ -38,15 +38,61 @@ impl std::fmt::Display for BridgeError {
     }
 }
 
-/// Everything one execution needs.
+/// Everything one execution needs: the model's `source`, the `servers` to
+/// generate modules for, the `bridge` to reach them, and the `limits` to honour.
+///
+/// `#[non_exhaustive]`: build it with [`RunRequest::new`] so adding a field later
+/// (e.g. a per-run id) is not a breaking change for out-of-tree backends.
+#[non_exhaustive]
 pub struct RunRequest {
+    /// The model-written program to run.
     pub source: String,
+    /// The servers exposed to this run; the backend generates one module each.
     pub servers: Vec<ServerTools>,
+    /// The one door out of the sandbox (already allowlist- and budget-checked).
     pub bridge: Bridge,
+    /// The resource limits to apply.
     pub limits: Limits,
 }
 
+impl RunRequest {
+    /// Assemble a request for one execution.
+    pub fn new(source: String, servers: Vec<ServerTools>, bridge: Bridge, limits: Limits) -> Self {
+        Self {
+            source,
+            servers,
+            bridge,
+            limits,
+        }
+    }
+}
+
+/// A backend that runs model-written code. This is the one extension point:
+/// community backends (other engines or languages) implement it.
+///
+/// Contract:
+/// - `run` must execute `request.source` in a **fresh, isolated context** each
+///   call (no state may leak between executions) and reach the outside world
+///   *only* through `request.bridge`. Generating the per-server modules and
+///   enforcing limits is the backend's responsibility.
+/// - It must never panic the caller: a thrown exception, a timeout, or a tripped
+///   limit is reported inside the returned [`Outcome`] (see [`crate::ExecError`]),
+///   not as a panic.
+/// - `capabilities` drives the model-facing guidance and is read once at startup.
+///
+/// Execution is island-local by contract: [`Bridge`] is `Rc<dyn Fn>` and `run`
+/// returns a [`LocalFuture`] (both `!Send`), because the engine runs on a single
+/// dedicated thread (Boa's `Context` is `!Send`). A naturally-`Send` backend (a
+/// V8 isolate pool, an out-of-process engine) must still conform to this `!Send`
+/// shape; `SubprocessRuntime` shows it crossing a process boundary.
+///
+/// Stability: the trait is **0.x and unstable** — it may change until a second
+/// independent backend validates it. The frozen invariant is the [`Bridge`]:
+/// pure data in, pure data out.
 pub trait CodeRuntime {
+    /// What the backend can do and the guidance shown to the model.
     fn capabilities(&self) -> Capabilities;
+
+    /// Run one execution to completion, returning its [`Outcome`].
     fn run(&self, request: RunRequest) -> LocalFuture<Outcome>;
 }
