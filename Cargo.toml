@@ -3,4 +3,50 @@ name = "codemode-mcp"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+strip = true
+lto = true
+opt-level = 3
+codegen-units = 1
+debug = false
+
 [dependencies]
+boa_engine = "0.21"
+boa_gc = "0.21"  # needed so the Trace/Finalize derives resolve `::boa_gc::...`
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "process"] }
+serde = { version = "1", features = ["derive"] }
+# preserve_order keeps JSON object keys in declared order instead of sorting
+# them alphabetically. This matters because tool results and generated module
+# sources are read by the model: stable, natural key order (id, name, ...) is
+# clearer than alphabetised, and avoids surprising reorderings on the wire.
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+futures-concurrency = "7"
+futures-lite = "2"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+rmcp = { version = "1.7", default-features = false, features = ["client", "transport-child-process", "local"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"], optional = true }
+rig-core = { version = "0.37", optional = true, default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[features]
+default = ["cli"]
+# The `codemode-mcp` binary: the MCP server + CLI.
+cli = ["dep:clap", "rmcp/server", "rmcp/transport-io"]
+# The adapter for embedding codemode in a Rig agent.
+rig = ["dep:rig-core"]
+# Run the model's code in a child process with OS resource limits (Unix).
+subprocess = ["dep:libc", "cli"]
+
+[[bin]]
+name = "codemode-mcp"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# For the serve end-to-end test: an MCP client connecting to our `serve` binary.
+rmcp = { version = "1.7", default-features = false, features = ["client", "transport-child-process", "local"] }

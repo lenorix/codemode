@@ -1,14 +1,32 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! codemode-mcp — run model-written code against MCP tools instead of exposing
+//! every tool directly. See `docs/` for the design and `docs/spec/` for the
+//! contracts.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod boa;
+mod codemode;
+mod config;
+mod error;
+mod local;
+mod mcp;
+mod runtime;
+mod source;
+mod types;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+#[cfg(feature = "rig")]
+pub mod rig;
+
+#[cfg(feature = "subprocess")]
+pub mod subprocess;
+
+pub use boa::Boa;
+pub use codemode::{CodeMode, CodeModeBuilder};
+pub use config::{Config, ServerConfig};
+pub use error::{Error, Result};
+pub use local::LocalTools;
+#[cfg(feature = "subprocess")]
+pub use subprocess::SubprocessRuntime;
+pub use runtime::{Bridge, BridgeError, CodeRuntime, RunRequest};
+pub use source::LocalFuture;
+pub use types::{
+    Capabilities, ExecError, Limits, Outcome, ServerInfo, ServerTools, ToolInfo,
+};

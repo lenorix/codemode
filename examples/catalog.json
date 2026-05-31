@@ -1,0 +1,86 @@
+{
+  "products": [
+    {
+      "id": "p1",
+      "name": "Pulse Earbuds",
+      "category": "audio",
+      "in_stock": true,
+      "units_sold_30d": 300,
+      "price_cents": 9000,
+      "restock_days": 0,
+      "reviews": [
+        { "rating": 5, "text": "Great bass" },
+        { "rating": 4, "text": "Fit could be snugger" },
+        { "rating": 5, "text": "Battery lasts a week" }
+      ]
+    },
+    {
+      "id": "p2",
+      "name": "Kepler Keyboard",
+      "category": "computing",
+      "in_stock": true,
+      "units_sold_30d": 200,
+      "price_cents": 12000,
+      "restock_days": 0,
+      "reviews": [
+        { "rating": 5, "text": "Crisp switches" },
+        { "rating": 5, "text": "Effortless typing" },
+        { "rating": 5, "text": "Worth every penny" }
+      ]
+    },
+    {
+      "id": "p3",
+      "name": "Ember Kettle",
+      "category": "kitchen",
+      "in_stock": true,
+      "units_sold_30d": 150,
+      "price_cents": 5000,
+      "restock_days": 0,
+      "reviews": [
+        { "rating": 5, "text": "Boils fast" },
+        { "rating": 5, "text": "No drips" },
+        { "rating": 4, "text": "A touch loud" },
+        { "rating": 5, "text": "Looks great" }
+      ]
+    },
+    {
+      "id": "p4",
+      "name": "Aurora Lamp",
+      "category": "home",
+      "in_stock": true,
+      "units_sold_30d": 120,
+      "price_cents": 4000,
+      "restock_days": 0,
+      "reviews": [
+        { "rating": 5, "text": "Lovely warm glow" },
+        { "rating": 4, "text": "Sturdy, a bit pricey" }
+      ]
+    },
+    {
+      "id": "p5",
+      "name": "Vertex Mouse",
+      "category": "computing",
+      "in_stock": false,
+      "units_sold_30d": 210,
+      "price_cents": 5500,
+      "restock_days": 7,
+      "reviews": [
+        { "rating": 4, "text": "Precise and light" },
+        { "rating": 5, "text": "Best mouse I've owned" }
+      ]
+    },
+    {
+      "id": "p6",
+      "name": "Drift Speaker",
+      "category": "audio",
+      "in_stock": true,
+      "units_sold_30d": 40,
+      "price_cents": 7000,
+      "restock_days": 0,
+      "reviews": [
+        { "rating": 2, "text": "Distorts when loud" },
+        { "rating": 3, "text": "Just okay for a desk" }
+      ]
+    }
+  ]
+}

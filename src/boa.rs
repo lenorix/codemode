@@ -1,0 +1,715 @@
+//! The Boa backend: the first `CodeRuntime`. Runs model-written JavaScript on a
+//! tokio current-thread event loop, exposes each MCP server as a generated
+//! `./servers/<name>` module, and reaches tools only through the bridge.
+
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ops::DerefMut;
+use std::panic::AssertUnwindSafe;
+use std::rc::Rc;
+
+use futures_util::FutureExt;
+
+use boa_engine::builtins::promise::PromiseState;
+use boa_engine::context::ContextBuilder;
+use boa_engine::context::time::JsInstant;
+use boa_engine::job::{GenericJob, Job, JobExecutor, NativeAsyncJob, PromiseJob, TimeoutJob};
+use boa_engine::module::{ModuleLoader, Referrer};
+use boa_engine::prelude::{Finalize, JsData, Trace};
+use boa_engine::{
+    Context, JsArgs, JsError, JsNativeError, JsResult, JsString, JsValue, Module, NativeFunction,
+    Source, js_string,
+};
+
+use crate::runtime::{Bridge, CodeRuntime, RunRequest};
+use crate::source::LocalFuture;
+use crate::types::{Capabilities, ExecError, Limits, Outcome, ServerTools};
+
+/// Per-execution state, attached to the Boa `Context` via host-defined data
+/// (`insert_data`/`get_data`) rather than thread-locals. Each execution owns its
+/// own state through its own context, so concurrent runs never share it. None of
+/// the fields hold GC pointers, hence `unsafe_ignore_trace`.
+#[derive(Trace, Finalize, JsData)]
+struct RunState {
+    #[unsafe_ignore_trace]
+    bridge: Bridge,
+    #[unsafe_ignore_trace]
+    logs: RefCell<Vec<String>>,
+    #[unsafe_ignore_trace]
+    log_budget: Cell<usize>,
+}
+
+/// The Boa engine. Cheap to construct; a fresh context is built per execution.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Boa;
+
+impl Boa {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl CodeRuntime for Boa {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            language: "javascript",
+            supports_async: true,
+            hard_memory_cap: false,
+            usage_guidance: GUIDANCE.to_string(),
+        }
+    }
+
+    fn run(&self, request: RunRequest) -> LocalFuture<Outcome> {
+        Box::pin(async move {
+            // A fresh Context is built (and dropped) inside `run_inner`, so all of
+            // this execution's JS heap and per-run state is released when it
+            // returns — nothing accumulates or leaks across runs.
+            let (result, logs) =
+                run_inner(&request.source, &request.servers, request.bridge, &request.limits).await;
+            match result {
+                Ok(value) => Outcome::ok(value, logs),
+                Err(err) => Outcome::failed(err, logs),
+            }
+        })
+    }
+}
+
+const GUIDANCE: &str = "\
+Write one JavaScript ES module and return its answer with `export default <value>` \
+at the top level. This is required: a `return`, `console.log`, or `module.exports` \
+does not return anything, and `console.log` only adds debug lines to `logs`. \
+Top-level await is allowed.
+
+Reach tools only by importing per-server modules, exactly \
+`import * as fs from './servers/filesystem'` (the `./servers/` prefix is required), \
+then calling the exported functions. Use the exact tool names from `find`; each \
+takes a single object argument (e.g. `await fs.readFile({ path })`) and returns a \
+Promise. You have no network, no filesystem, and no `fetch` of your own — the \
+imported server modules are the only way out.
+
+Modern JavaScript works (optional chaining, spread, destructuring, template \
+literals, Array/Object/Map/Set/JSON, Promise.all). `Intl` and `structuredClone` \
+are not available; format numbers with `toFixed`. Do the whole task in this one \
+program so only the final result returns.";
+
+/// Build a fresh context, run `source`, and return `(result, captured logs)`.
+/// Logs are read from the context's `RunState` afterwards, so they're returned
+/// on every path (success, exception, timeout, limit).
+async fn run_inner(
+    source: &str,
+    servers: &[ServerTools],
+    bridge: Bridge,
+    limits: &Limits,
+) -> (Result<serde_json::Value, ExecError>, Vec<String>) {
+    let loader = Rc::new(ServerModuleLoader::new(servers));
+    let queue = Rc::new(Queue::default());
+    let mut context = match ContextBuilder::new()
+        .job_executor(queue.clone())
+        .module_loader(loader)
+        .build()
+    {
+        Ok(context) => context,
+        Err(e) => return (Err(js(e)), Vec::new()),
+    };
+
+    {
+        let rl = context.runtime_limits_mut();
+        rl.set_loop_iteration_limit(limits.max_loop_iterations);
+        rl.set_recursion_limit(limits.max_recursion_depth);
+        rl.set_stack_size_limit(limits.max_stack_size);
+    }
+
+    if let Err(e) = install_globals(&mut context) {
+        return (Err(js(e)), Vec::new());
+    }
+    context.insert_data(RunState {
+        bridge,
+        logs: RefCell::new(Vec::new()),
+        log_budget: Cell::new(limits.max_output_bytes),
+    });
+
+    let result = async {
+        let module =
+            Module::parse(Source::from_bytes(source.as_bytes()), None, &mut context).map_err(js)?;
+
+        // Boa panics when a runtime limit (loop / recursion / stack) fires during
+        // *module* evaluation, because it can't turn that error into a promise
+        // rejection reason. We catch that panic and return a clean Limit error;
+        // the context is fresh per run and dropped right after, so a poisoned
+        // engine state can't leak. (The robust fix is subprocess isolation; see docs.)
+        let eval = AssertUnwindSafe(async {
+            let promise = module.load_link_evaluate(&mut context);
+            queue.clone().run_jobs_async(&RefCell::new(&mut context)).await?;
+            Ok::<_, JsError>(promise)
+        })
+        .catch_unwind();
+
+        let promise = match tokio::time::timeout(limits.timeout, eval).await {
+            Err(_) => return Err(ExecError::Timeout),
+            Ok(Err(_panic)) => {
+                return Err(ExecError::Limit {
+                    what: "execution aborted: a runtime limit (loop, recursion or stack) was exceeded"
+                        .to_string(),
+                });
+            }
+            Ok(Ok(Err(err))) => return Err(classify(err.to_string())),
+            Ok(Ok(Ok(promise))) => promise,
+        };
+
+        match promise.state() {
+            PromiseState::Fulfilled(_) => {
+                let default = module
+                    .namespace(&mut context)
+                    .get(js_string!("default"), &mut context)
+                    .map_err(js)?;
+                // The single most common LLM mistake is computing the answer but
+                // never exporting it (using `return`, `console.log`, or
+                // `module.exports`). All of those leave `default` undefined.
+                // Surface a fix-naming error instead of a silent `null` the model
+                // can't act on.
+                if default.is_undefined() {
+                    return Err(ExecError::Js {
+                        message: "no value was exported: assign your answer with \
+                                  `export default <value>` at the top level (not `return`, \
+                                  `console.log`, or `module.exports`)"
+                            .to_string(),
+                    });
+                }
+                let value =
+                    default.to_json(&mut context).map_err(js)?.unwrap_or(serde_json::Value::Null);
+                check_output_size(&value, limits.max_output_bytes)?;
+                Ok(value)
+            }
+            // Render the rejection via JS string. RuntimeLimit errors are special
+            // and can't be made opaque, so don't try.
+            PromiseState::Rejected(err) => {
+                let message = err
+                    .to_string(&mut context)
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_else(|_| "uncaught exception".to_string());
+                Err(classify(message))
+            }
+            PromiseState::Pending => Err(ExecError::Js {
+                message: "module did not finish executing".to_string(),
+            }),
+        }
+    }
+    .await;
+
+    let logs = context
+        .remove_data::<RunState>()
+        .map(|state| state.logs.borrow().clone())
+        .unwrap_or_default();
+    (result, logs)
+}
+
+fn js(err: impl ToString) -> ExecError {
+    ExecError::Js { message: err.to_string() }
+}
+
+/// Bound the serialized result without buffering it whole.
+fn check_output_size(value: &serde_json::Value, max_bytes: usize) -> Result<(), ExecError> {
+    if crate::types::serialized_within(value, max_bytes) {
+        Ok(())
+    } else {
+        Err(ExecError::OutputTooLarge)
+    }
+}
+
+/// Map a JS error to an execution error, recognising the structural limits.
+/// Boa's messages: "Maximum loop iteration limit N exceeded",
+/// "exceeded maximum number of recursive calls", "exceeded maximum call stack length".
+fn classify(message: String) -> ExecError {
+    let lower = message.to_lowercase();
+    let is_limit = lower.contains("loop iteration limit")
+        || lower.contains("exceeded maximum number of recursive calls")
+        || lower.contains("exceeded maximum call stack length");
+    if is_limit {
+        ExecError::Limit { what: message }
+    } else {
+        ExecError::Js { message }
+    }
+}
+
+fn install_globals(context: &mut Context) -> JsResult<()> {
+    context.register_global_builtin_callable(
+        js_string!("__codemodeCall"),
+        3,
+        NativeFunction::from_async_fn(bridge_call),
+    )?;
+    context.register_global_builtin_callable(
+        js_string!("__codemodeLog"),
+        1,
+        NativeFunction::from_fn_ptr(log),
+    )?;
+    context.eval(Source::from_bytes(
+        b"globalThis.console = { log(...a){ __codemodeLog(a.map(String).join(' ')); }, \
+           error(...a){ __codemodeLog(a.map(String).join(' ')); }, \
+           warn(...a){ __codemodeLog(a.map(String).join(' ')); }, \
+           info(...a){ __codemodeLog(a.map(String).join(' ')); } };",
+    ))?;
+    Ok(())
+}
+
+fn log(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    // `to_string` on a JS string is cheap (no copy); converting to a Rust String
+    // is the allocation. Check the budget against the JS length first so a giant
+    // line (`'x'.repeat(1e9)`) is never copied into Rust just to be discarded.
+    let js = args.get_or_undefined(0).to_string(context)?;
+    let Some(state) = context.get_data::<RunState>() else {
+        return Ok(JsValue::undefined());
+    };
+    let remaining = state.log_budget.get();
+    if remaining == 0 {
+        return Ok(JsValue::undefined());
+    }
+    if js.len() > remaining {
+        state.log_budget.set(0);
+        state.logs.borrow_mut().push("[logs truncated]".to_string());
+    } else {
+        let line = js.to_std_string_escaped();
+        state.log_budget.set(remaining.saturating_sub(line.len()));
+        state.logs.borrow_mut().push(line);
+    }
+    Ok(JsValue::undefined())
+}
+
+/// The async native function backing every generated tool call. Reads the
+/// per-run bridge from the context's `RunState` and forwards `(server, tool, args)`.
+fn bridge_call(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &RefCell<&mut Context>,
+) -> impl std::future::Future<Output = JsResult<JsValue>> {
+    let (server, tool, args_json, bridge) = {
+        let mut ctx = context.borrow_mut();
+        let server = string_arg(args, 0, &mut ctx);
+        let tool = string_arg(args, 1, &mut ctx);
+        let args_json = string_arg(args, 2, &mut ctx);
+        let bridge = ctx.get_data::<RunState>().map(|s| s.bridge.clone());
+        (server, tool, args_json, bridge)
+    };
+
+    async move {
+        let bridge = bridge.ok_or_else(|| JsNativeError::typ().with_message("bridge unavailable"))?;
+        // Args arrive JSON-stringified (the generated wrappers do this); parse in
+        // Rust. A non-JSON argument is a clear error, not a silent null.
+        let value: serde_json::Value = serde_json::from_str(&args_json)
+            .map_err(|_| JsNativeError::typ().with_message("tool arguments must be a JSON string"))?;
+        match bridge(server, tool, value).await {
+            Ok(result) => {
+                let mut ctx = context.borrow_mut();
+                JsValue::from_json(&result, &mut ctx)
+            }
+            Err(err) => Err(JsNativeError::typ().with_message(err.to_string()).into()),
+        }
+    }
+}
+
+fn string_arg(args: &[JsValue], i: usize, context: &mut Context) -> String {
+    args.get_or_undefined(i)
+        .to_string(context)
+        .map(|s| s.to_std_string_escaped())
+        .unwrap_or_default()
+}
+
+/// Resolves `./servers/<name>` to a generated module; rejects everything else.
+struct ServerModuleLoader {
+    sources: HashMap<String, String>,
+    names: Vec<String>,
+}
+
+impl ServerModuleLoader {
+    fn new(servers: &[ServerTools]) -> Self {
+        let sources = servers
+            .iter()
+            .map(|s| (format!("./servers/{}", s.name), module_source(s)))
+            .collect();
+        let names = servers.iter().map(|s| s.name.clone()).collect();
+        Self { sources, names }
+    }
+}
+
+impl ModuleLoader for ServerModuleLoader {
+    async fn load_imported_module(
+        self: Rc<Self>,
+        _referrer: Referrer,
+        specifier: JsString,
+        context: &RefCell<&mut Context>,
+    ) -> JsResult<Module> {
+        let spec = specifier.to_std_string_escaped();
+        match self.sources.get(&spec) {
+            Some(src) => Module::parse(Source::from_bytes(src.as_bytes()), None, &mut context.borrow_mut()),
+            // Name the available servers and show the exact import shape, so a
+            // wrong name or a missing `./servers/` prefix self-corrects.
+            None => Err(JsNativeError::typ()
+                .with_message(format!(
+                    "module not found: {spec}. Import a server as \
+                     `import * as x from './servers/<name>'`; available servers: {}",
+                    available(&self.names),
+                ))
+                .into()),
+        }
+    }
+}
+
+fn available(names: &[String]) -> String {
+    if names.is_empty() {
+        "(none)".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
+/// Generate the JS module for one server: one exported function per tool, each
+/// forwarding to the bridge. Args are JSON-stringified in JS and parsed in Rust,
+/// so prototype pollution can't corrupt what we forward.
+fn module_source(server: &ServerTools) -> String {
+    let mut out = String::from("const __c = globalThis.__codemodeCall;\n");
+    let server_lit = json_lit(&server.name);
+    for (i, tool) in server.tools.iter().enumerate() {
+        let tool_lit = json_lit(&tool.name);
+        if let Some(desc) = &tool.description {
+            out.push_str(&format!("/** {} */\n", desc.replace("*/", "* /")));
+        }
+        // Define under an internal identifier, then export under the exact tool
+        // name via a string-named export. This works for any name — a normal name
+        // like `echo` is still reached as `ns.echo`, an odd one as `ns["a-b"]` —
+        // and sidesteps JS-identifier and reserved-word edge cases entirely.
+        out.push_str(&format!(
+            "function __t{i}(args) {{ return __c({server_lit}, {tool_lit}, JSON.stringify(args === undefined ? {{}} : args)); }}\n"
+        ));
+        out.push_str(&format!("export {{ __t{i} as {tool_lit} }};\n"));
+    }
+    out
+}
+
+fn json_lit(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
+}
+
+// --- Event loop: a tokio-driven JobExecutor, adapted from Boa's
+// `tokio_event_loop` example (v0.21.1). ---
+
+#[derive(Default)]
+struct Queue {
+    async_jobs: RefCell<VecDeque<NativeAsyncJob>>,
+    promise_jobs: RefCell<VecDeque<PromiseJob>>,
+    timeout_jobs: RefCell<BTreeMap<JsInstant, TimeoutJob>>,
+    generic_jobs: RefCell<VecDeque<GenericJob>>,
+}
+
+impl Queue {
+    fn drain_timeout_jobs(&self, context: &mut Context) {
+        let now = context.clock().now();
+        let mut borrow = self.timeout_jobs.borrow_mut();
+        let mut keep = borrow.split_off(&now);
+        keep.retain(|_, job| !job.is_cancelled());
+        let run = std::mem::replace(borrow.deref_mut(), keep);
+        drop(borrow);
+        for job in run.into_values() {
+            if let Err(e) = job.call(context) {
+                eprintln!("Uncaught {e}");
+            }
+        }
+    }
+
+    fn drain_jobs(&self, context: &mut Context) {
+        self.drain_timeout_jobs(context);
+        if let Some(generic) = self.generic_jobs.borrow_mut().pop_front()
+            && let Err(err) = generic.call(context)
+        {
+            eprintln!("Uncaught {err}");
+        }
+        let jobs = std::mem::take(&mut *self.promise_jobs.borrow_mut());
+        for job in jobs {
+            if let Err(e) = job.call(context) {
+                eprintln!("Uncaught {e}");
+            }
+        }
+        context.clear_kept_objects();
+    }
+}
+
+impl JobExecutor for Queue {
+    fn enqueue_job(self: Rc<Self>, job: Job, context: &mut Context) {
+        match job {
+            Job::PromiseJob(job) => self.promise_jobs.borrow_mut().push_back(job),
+            Job::AsyncJob(job) => self.async_jobs.borrow_mut().push_back(job),
+            Job::TimeoutJob(t) => {
+                let now = context.clock().now();
+                self.timeout_jobs.borrow_mut().insert(now + t.timeout(), t);
+            }
+            Job::GenericJob(g) => self.generic_jobs.borrow_mut().push_back(g),
+            _ => {}
+        }
+    }
+
+    fn run_jobs(self: Rc<Self>, context: &mut Context) -> JsResult<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| JsNativeError::typ().with_message(e.to_string()))?;
+        tokio::task::LocalSet::default()
+            .block_on(&runtime, self.run_jobs_async(&RefCell::new(context)))
+    }
+
+    async fn run_jobs_async(self: Rc<Self>, context: &RefCell<&mut Context>) -> JsResult<()> {
+        use futures_concurrency::future::FutureGroup;
+        use futures_lite::StreamExt;
+
+        let mut group = FutureGroup::new();
+        loop {
+            // Run every ready microtask / timeout / generic job, then pick up any
+            // async jobs they enqueued.
+            self.drain_jobs(&mut context.borrow_mut());
+            for job in std::mem::take(&mut *self.async_jobs.borrow_mut()) {
+                group.insert(job.call(context));
+            }
+
+            let microtasks_pending = !self.promise_jobs.borrow().is_empty()
+                || !self.timeout_jobs.borrow().is_empty()
+                || !self.generic_jobs.borrow().is_empty();
+
+            if group.is_empty() && !microtasks_pending {
+                return Ok(());
+            }
+            if microtasks_pending {
+                // More synchronous work queued; loop to drain it.
+                tokio::task::yield_now().await;
+            } else if let Some(Err(err)) = group.next().await {
+                // Only async jobs (e.g. an in-flight tool call) remain: await one
+                // instead of busy-polling, so a waiting execution doesn't spin.
+                eprintln!("Uncaught {err}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::runtime::BridgeError;
+    use crate::types::ToolInfo;
+
+    fn demo_servers() -> Vec<ServerTools> {
+        vec![ServerTools {
+            name: "demo".to_string(),
+            tools: vec![ToolInfo {
+                name: "echo".to_string(),
+                description: None,
+                input_schema: json!({ "type": "object" }),
+            }],
+        }]
+    }
+
+    fn run(source: &str, servers: Vec<ServerTools>, bridge: Bridge) -> Outcome {
+        run_with(source, servers, bridge, Limits::default())
+    }
+
+    fn run_with(source: &str, servers: Vec<ServerTools>, bridge: Bridge, limits: Limits) -> Outcome {
+        let request = RunRequest { source: source.to_string(), servers, bridge, limits };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&rt, Boa::new().run(request))
+    }
+
+    fn echo_bridge() -> Bridge {
+        Rc::new(|_s, _t, args| Box::pin(async move { Ok(args) }))
+    }
+
+    #[test]
+    fn imports_and_calls_a_tool() {
+        let bridge: Bridge = Rc::new(|_server, _tool, args| Box::pin(async move { Ok(args) }));
+        let outcome = run(
+            "import * as demo from './servers/demo';\n\
+             const r = await demo.echo({ hi: 1 });\n\
+             export default r;",
+            demo_servers(),
+            bridge,
+        );
+        assert!(outcome.error.is_none(), "unexpected error: {:?}", outcome.error);
+        assert_eq!(outcome.result, json!({ "hi": 1 }));
+    }
+
+    #[test]
+    fn captures_console_log() {
+        let bridge: Bridge = Rc::new(|_s, _t, args| Box::pin(async move { Ok(args) }));
+        let outcome = run("console.log('hello', 42); export default 1;", vec![], bridge);
+        assert!(outcome.error.is_none());
+        assert_eq!(outcome.logs, vec!["hello 42".to_string()]);
+    }
+
+    #[test]
+    fn handles_non_identifier_tool_names() {
+        let bridge: Bridge = Rc::new(|_s, tool, _a| {
+            Box::pin(async move { Ok(serde_json::json!({ "called": tool })) })
+        });
+        let servers = vec![ServerTools {
+            name: "demo".to_string(),
+            tools: vec![ToolInfo {
+                name: "weird-tool.name".to_string(),
+                description: None,
+                input_schema: json!({}),
+            }],
+        }];
+        let outcome = run(
+            "import * as demo from './servers/demo';\n\
+             const r = await demo['weird-tool.name']({});\n\
+             export default r;",
+            servers,
+            bridge,
+        );
+        assert!(outcome.error.is_none(), "error: {:?}", outcome.error);
+        assert_eq!(outcome.result, json!({ "called": "weird-tool.name" }));
+    }
+
+    #[test]
+    fn unknown_server_import_fails() {
+        let bridge: Bridge = Rc::new(|_s, _t, args| Box::pin(async move { Ok(args) }));
+        let outcome = run(
+            "import * as x from './servers/nope'; export default 1;",
+            demo_servers(),
+            bridge,
+        );
+        let Some(ExecError::Js { message }) = outcome.error else {
+            panic!("expected a Js error, got {:?}", outcome.error);
+        };
+        // The message should guide the model back on track: name the available
+        // servers so it can pick a real one rather than guess again.
+        assert!(message.contains("demo"), "should list available servers: {message}");
+    }
+
+    #[test]
+    fn missing_default_export_is_a_clear_error() {
+        // The most common LLM mistake: compute the answer but never `export
+        // default` it. Returning a silent `null` gives the model nothing to fix,
+        // so it retries blindly. A clear error names the fix.
+        let outcome = run("const answer = 41 + 1; console.log(answer);", vec![], echo_bridge());
+        let Some(ExecError::Js { message }) = outcome.error else {
+            panic!("expected a Js error, got {:?}", outcome.error);
+        };
+        assert!(message.contains("export default"), "should name the fix: {message}");
+    }
+
+    #[test]
+    fn explicit_null_export_is_allowed() {
+        // `export default null` is a real answer, not the missing-export mistake.
+        let outcome = run("export default null;", vec![], echo_bridge());
+        assert!(outcome.error.is_none(), "unexpected error: {:?}", outcome.error);
+        assert_eq!(outcome.result, json!(null));
+    }
+
+    #[test]
+    fn sandbox_exposes_no_host_globals() {
+        // None of the usual escape hatches should exist: the engine is sandboxed
+        // by construction and we register only the MCP door and a console shim.
+        let outcome = run(
+            "const present = [];\n\
+             for (const n of ['fetch','process','require','Deno','XMLHttpRequest','WebSocket','global']) {\n\
+               if (typeof globalThis[n] !== 'undefined') present.push(n);\n\
+             }\n\
+             export default present;",
+            vec![],
+            echo_bridge(),
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(outcome.result, json!([]));
+    }
+
+    #[test]
+    fn frees_memory_between_runs() {
+        // A run that allocates a large array completes, and the next run is
+        // unaffected — the per-run context (and its heap) was dropped.
+        let big = run(
+            "const a = new Array(500000).fill(7); export default a.length;",
+            vec![],
+            echo_bridge(),
+        );
+        assert!(big.error.is_none(), "{:?}", big.error);
+        assert_eq!(big.result, json!(500000));
+
+        let after = run("export default 1 + 1;", vec![], echo_bridge());
+        assert!(after.error.is_none());
+        assert_eq!(after.result, json!(2));
+    }
+
+    #[test]
+    fn infinite_loop_is_caught_not_panicking() {
+        // A runtime-limit hit during module evaluation makes Boa panic internally;
+        // we must catch it and return a clean Limit error, keeping the island alive.
+        let limits = Limits { max_loop_iterations: 100_000, ..Limits::default() };
+        let outcome = run_with("while (true) {} export default 1;", vec![], echo_bridge(), limits);
+        assert!(
+            matches!(outcome.error, Some(ExecError::Limit { .. })),
+            "expected a Limit error, got {:?}",
+            outcome.error
+        );
+        // And the engine still works for a subsequent run (island not dead).
+        let after = run("export default 2 + 2;", vec![], echo_bridge());
+        assert_eq!(after.result, json!(4));
+    }
+
+    #[test]
+    fn recursion_limit_trips() {
+        let limits = Limits { max_recursion_depth: 20, ..Limits::default() };
+        let outcome = run_with(
+            "function r(n){ return n > 0 ? r(n - 1) + 1 : 0; } export default r(100);",
+            vec![],
+            echo_bridge(),
+            limits,
+        );
+        assert!(
+            matches!(outcome.error, Some(ExecError::Limit { .. })),
+            "expected a Limit error, got {:?}",
+            outcome.error
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_result() {
+        let limits = Limits { max_output_bytes: 256, ..Limits::default() };
+        let outcome = run_with(
+            "export default 'x'.repeat(10000);",
+            vec![],
+            echo_bridge(),
+            limits,
+        );
+        assert!(matches!(outcome.error, Some(ExecError::OutputTooLarge)));
+    }
+
+    #[test]
+    fn caps_log_output() {
+        let limits = Limits { max_output_bytes: 200, ..Limits::default() };
+        let outcome = run_with(
+            "for (let i = 0; i < 1000; i++) console.log('noisy log line number ' + i);\n\
+             export default 'done';",
+            vec![],
+            echo_bridge(),
+            limits,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        let bytes: usize = outcome.logs.iter().map(|l| l.len()).sum();
+        assert!(bytes <= 256, "logs not capped: {bytes} bytes");
+        assert_eq!(outcome.logs.last().map(String::as_str), Some("[logs truncated]"));
+    }
+
+    #[test]
+    fn bridge_error_surfaces() {
+        let bridge: Bridge =
+            Rc::new(|_s, _t, _a| Box::pin(async move { Err(BridgeError::Call("boom".into())) }));
+        let outcome = run(
+            "import * as demo from './servers/demo';\n\
+             await demo.echo({}); export default 'unreached';",
+            demo_servers(),
+            bridge,
+        );
+        assert!(matches!(outcome.error, Some(ExecError::Js { .. })));
+    }
+}

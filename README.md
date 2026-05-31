@@ -1,21 +1,75 @@
-# code-execution-with-mcp
+# codemode-mcp
 
-An experiment in running MCP tools by writing code instead of calling them one by one.
+Run MCP tools by writing code instead of calling them one by one.
 
-The normal way to use MCP is to hand the model every tool a server exposes. It works, but it
-gets expensive fast. All those tool definitions sit in the context, and every intermediate
-result has to travel back through the model before you can do anything with it.
+The normal way to use MCP is to hand the model every tool a server exposes. It works, but it gets
+expensive fast. All those tool definitions sit in the context, and every intermediate result has to
+travel back through the model before you can do anything with it.
 
 The idea here, borrowed from Cloudflare's "code mode" and Anthropic's writeup, is to flip that
-around. Give the model just three tools (one to discover servers, one to look up the tools on
-them, and one to run TypeScript) and let it write code that does the orchestration. Loops,
-filtering, chaining calls together, all of it happens in the code instead of the chat.
+around. Give the model just three tools (discover servers, find a server's tools, and execute code)
+and let it write a program that does the orchestration. Loops, filtering, chaining calls together,
+all of it happens in the code instead of the chat, so intermediate results never re-enter the
+context.
 
-The TypeScript runs in an embedded Deno/Bun runtime, locked down so it can't touch the network,
-the filesystem, or anything else on the host. The only things the code can reach are the
-functions that actually call the MCP tools. Everything else is off the table.
+The code runs in an embedded [Boa](https://github.com/boa-dev/boa) engine (a pure-Rust JavaScript
+interpreter), locked down so it can't touch the network, the filesystem, or anything else on the
+host. The only way out is the per-server modules we generate from the tools you expose, and the
+allowlist behind them is enforced in Rust. The engine sits behind a `CodeRuntime` trait, so the
+community can add other engines and languages later.
 
-## Status
+## Two ways to use it
 
-Very early. There's basically nothing here yet beyond the scaffolding. Design notes and the
-links I'm working from live in [docs/](docs/README.md).
+As a **library / Rig dependency** (the `codemode()`-for-Rust shape): wrap your MCP servers (and/or
+in-Rust tools) and give a Rig agent the three-tool surface instead of every tool.
+
+```rust
+use std::sync::Arc;
+use codemode_mcp::{CodeMode, ServerConfig};
+use codemode_mcp::rig::CodeModeExt;
+
+let cm = Arc::new(
+    CodeMode::builder()
+        .server(ServerConfig::stdio("filesystem", "npx",
+                ["-y", "@modelcontextprotocol/server-filesystem", "."]))
+        .build()
+        .await?,
+);
+
+let agent = client.agent(model).preamble("…").code_mode(&cm).build();
+```
+
+As a **standalone MCP server** any host can configure:
+
+```jsonc
+{ "mcpServers": { "codemode": {
+    "command": "codemode-mcp",
+    "args": ["serve", "--config", "servers.toml"] } } }
+```
+
+`--config` takes our `servers.toml` (servers + allowlist + limits) or a standard `.mcp.json`.
+
+## Try it
+
+```sh
+cargo test # the full suite
+cargo run --bin codemode-mcp -- tools --config servers.toml   # list the exposed servers and tools
+cargo run --example token_savings # token usage: traditional vs. code mode (needs a local LLM)
+```
+
+The `token_savings` example runs the same task both ways against a local OpenAI-compatible model
+and reports the tokens each consumed. A sample run (a 6-product "find the best-rated product" task
+against a local model) reached the same answer with far fewer tokens:
+
+```
+traditional: 5900 tokens
+code mode:   2255 tokens
+saved:       3645 tokens (62% fewer)
+```
+
+## Docs
+
+Design and contracts live in [docs/](docs/README.md): the [Boa engine](docs/boa-integration.md),
+the [engine-agnostic seam](docs/engine-agnostic.md), the [MCP client](docs/mcp-client.md), the
+[two surfaces](docs/surfaces.md), the [security model](docs/security.md), and the API/CLI specs in
+[docs/spec/](docs/spec/).
