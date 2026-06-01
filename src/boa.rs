@@ -199,41 +199,7 @@ async fn run_inner(
 
         match promise.state() {
             PromiseState::Fulfilled(_) => {
-                let default = module
-                    .namespace(&mut context)
-                    .get(js_string!("default"), &mut context)
-                    .map_err(js)?;
-                // The single most common LLM mistake is computing the answer but
-                // never exporting it (using `return`, `console.log`, or
-                // `module.exports`). All of those leave `default` undefined.
-                // Surface a fix-naming error instead of a silent `null` the model
-                // can't act on.
-                if default.is_undefined() {
-                    return Err(ExecError::Exception {
-                        message: "no value was exported: assign your answer with \
-                                  `export default <value>` at the top level (not `return`, \
-                                  `console.log`, or `module.exports`)"
-                            .to_string(),
-                    });
-                }
-                // `to_json` recurses one native frame per nesting level (so a deep
-                // result would overflow the island stack and *abort* the process),
-                // and it eagerly `Vec::with_capacity(arr.length)`s arrays (so a
-                // sparse array with a huge `.length` would try to allocate tens of
-                // GB and abort), both before the size cap can see the result. Vet
-                // the value iteratively first and reject if it's pathological.
-                result_convertible(
-                    &default,
-                    &mut context,
-                    MAX_RESULT_DEPTH,
-                    limits.max_output_bytes,
-                )?;
-                let value = default
-                    .to_json(&mut context)
-                    .map_err(js)?
-                    .unwrap_or(serde_json::Value::Null);
-                check_output_size(&value, limits.max_output_bytes)?;
-                Ok(value)
+                exported_value(&module, &mut context, limits.max_output_bytes)
             }
             // Render the rejection via JS string. RuntimeLimit errors are special
             // and can't be made opaque, so don't try.
@@ -262,6 +228,41 @@ fn js(err: impl ToString) -> ExecError {
     ExecError::Exception {
         message: err.to_string(),
     }
+}
+
+/// Extract a fulfilled module's `export default` as JSON, vetting it on the way
+/// out. A missing export becomes a fix-naming error (the most common LLM mistake)
+/// rather than a silent `null`; then the value is checked for the depth and
+/// sparse-array hazards that would otherwise abort `to_json`, and for the size cap.
+fn exported_value(
+    module: &Module,
+    context: &mut Context,
+    max_output_bytes: usize,
+) -> Result<serde_json::Value, ExecError> {
+    let default = module
+        .namespace(context)
+        .get(js_string!("default"), context)
+        .map_err(js)?;
+    if default.is_undefined() {
+        return Err(ExecError::Exception {
+            message: "no value was exported: assign your answer with \
+                      `export default <value>` at the top level (not `return`, \
+                      `console.log`, or `module.exports`)"
+                .to_string(),
+        });
+    }
+    // `to_json` recurses one native frame per nesting level (so a deep result
+    // would overflow the island stack and *abort* the process), and it eagerly
+    // `Vec::with_capacity(arr.length)`s arrays (so a sparse array with a huge
+    // `.length` would try to allocate tens of GB and abort), both before the size
+    // cap can see the result. Vet the value iteratively first.
+    result_convertible(&default, context, MAX_RESULT_DEPTH, max_output_bytes)?;
+    let value = default
+        .to_json(context)
+        .map_err(js)?
+        .unwrap_or(serde_json::Value::Null);
+    check_output_size(&value, max_output_bytes)?;
+    Ok(value)
 }
 
 /// Bound the serialized result without buffering it whole.

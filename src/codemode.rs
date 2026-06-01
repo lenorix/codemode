@@ -69,7 +69,7 @@ impl CodeMode {
         max_concurrent: usize,
     ) -> Result<Self> {
         let capabilities = runtime.capabilities();
-        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let (tx, rx) = mpsc::unbounded_channel::<Command>();
 
         // Build the island's runtime here so a failure is returned to the caller
         // rather than panicking the spawned thread.
@@ -83,70 +83,10 @@ impl CodeMode {
             .name("codemode-island".to_string())
             .spawn(move || {
                 let local = tokio::task::LocalSet::new();
-                local.block_on(&rt, async move {
-                    let source = factory();
-                    let runtime: Rc<dyn CodeRuntime + Send> = Rc::from(runtime);
-                    let allow = Rc::new(allow);
-                    let limits = Rc::new(limits);
-                    // The exposed server set is fixed for a CodeMode's life. The
-                    // OnceCell computes it once and single-flights it, so concurrent
-                    // first executes don't each connect + list (racing the MCP cache).
-                    let exposed = Rc::new(OnceCell::<Vec<ServerTools>>::new());
-                    // Bounds executions running at once: each holds a JS context, so
-                    // a flood of execute() calls queues instead of exhausting memory.
-                    let slots = Arc::new(Semaphore::new(max_concurrent));
-                    // Executions run concurrently: each is its own task with a fresh
-                    // context (see boa.rs), so they never interfere. discover/find
-                    // are cheap and run inline.
-                    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-                    while let Some(command) = rx.recv().await {
-                        // Drop handles of finished executions every iteration so the
-                        // Vec tracks only what's in flight.
-                        tasks.retain(|t| !t.is_finished());
-                        match command {
-                            Command::Discover(reply) => {
-                                let _ = reply.send(discover(&source, &allow).await);
-                            }
-                            Command::Find(server, reply) => {
-                                let _ = reply.send(find(&source, &allow, &server).await);
-                            }
-                            Command::Execute(code, reply) => {
-                                // Acquire a slot *before* spawning, so the number of
-                                // in-flight executions (each holds a JS context) is
-                                // bounded and the loop applies backpressure here rather
-                                // than letting tasks pile up. The permit moves into the
-                                // task and frees the slot when it finishes. A closed
-                                // semaphore can't happen (we never close it).
-                                let Ok(permit) = slots.clone().acquire_owned().await else {
-                                    continue;
-                                };
-                                tasks.push(tokio::task::spawn_local(run_execution(
-                                    permit,
-                                    source.clone(),
-                                    runtime.clone(),
-                                    allow.clone(),
-                                    limits.clone(),
-                                    exposed.clone(),
-                                    code,
-                                    reply,
-                                )));
-                            }
-                            Command::Shutdown(reply) => {
-                                for task in tasks.drain(..) {
-                                    let _ = task.await;
-                                }
-                                let _ = reply.send(());
-                                break;
-                            }
-                        }
-                    }
-                    // Let any in-flight executions finish, then cancel MCP
-                    // connections while the reactor is still alive.
-                    for task in tasks.drain(..) {
-                        let _ = task.await;
-                    }
-                    source.shutdown().await;
-                });
+                local.block_on(
+                    &rt,
+                    island_loop(rx, factory, runtime, allow, limits, max_concurrent),
+                );
             })
             .map_err(|e| Error::Island(e.to_string()))?;
 
@@ -331,6 +271,81 @@ impl CodeModeBuilder {
             self.max_concurrent,
         )
     }
+}
+
+/// The island's event loop. Builds the tool source on the island thread (MCP
+/// connections are `!Send`), then services commands until the channel closes or a
+/// `Shutdown` arrives, running each execution as its own `spawn_local` task
+/// bounded by the concurrency semaphore. Driven by `LocalSet::block_on` in
+/// [`CodeMode::spawn`]; everything here is island-local and never crosses threads.
+async fn island_loop(
+    mut rx: mpsc::UnboundedReceiver<Command>,
+    factory: SourceFactory,
+    runtime: Box<dyn CodeRuntime + Send>,
+    allow: AllowList,
+    limits: Limits,
+    max_concurrent: usize,
+) {
+    let source = factory();
+    let runtime: Rc<dyn CodeRuntime + Send> = Rc::from(runtime);
+    let allow = Rc::new(allow);
+    let limits = Rc::new(limits);
+    // The exposed server set is fixed for a CodeMode's life. The OnceCell computes
+    // it once and single-flights it, so concurrent first executes don't each
+    // connect + list (racing the MCP cache).
+    let exposed = Rc::new(OnceCell::<Vec<ServerTools>>::new());
+    // Bounds executions running at once: each holds a JS context, so a flood of
+    // execute() calls queues instead of exhausting memory.
+    let slots = Arc::new(Semaphore::new(max_concurrent));
+    // Executions run concurrently: each is its own task with a fresh context (see
+    // boa.rs), so they never interfere. discover/find are cheap and run inline.
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    while let Some(command) = rx.recv().await {
+        // Drop handles of finished executions every iteration so the Vec tracks
+        // only what's in flight.
+        tasks.retain(|t| !t.is_finished());
+        match command {
+            Command::Discover(reply) => {
+                let _ = reply.send(discover(&source, &allow).await);
+            }
+            Command::Find(server, reply) => {
+                let _ = reply.send(find(&source, &allow, &server).await);
+            }
+            Command::Execute(code, reply) => {
+                // Acquire a slot *before* spawning, so the number of in-flight
+                // executions (each holds a JS context) is bounded and the loop
+                // applies backpressure here rather than letting tasks pile up. The
+                // permit moves into the task and frees the slot when it finishes. A
+                // closed semaphore can't happen (we never close it).
+                let Ok(permit) = slots.clone().acquire_owned().await else {
+                    continue;
+                };
+                tasks.push(tokio::task::spawn_local(run_execution(
+                    permit,
+                    source.clone(),
+                    runtime.clone(),
+                    allow.clone(),
+                    limits.clone(),
+                    exposed.clone(),
+                    code,
+                    reply,
+                )));
+            }
+            Command::Shutdown(reply) => {
+                for task in tasks.drain(..) {
+                    let _ = task.await;
+                }
+                let _ = reply.send(());
+                break;
+            }
+        }
+    }
+    // Let any in-flight executions finish, then cancel MCP connections while the
+    // reactor is still alive.
+    for task in tasks.drain(..) {
+        let _ = task.await;
+    }
+    source.shutdown().await;
 }
 
 async fn discover(source: &Rc<dyn ToolSource>, allow: &AllowList) -> Result<Vec<ServerInfo>> {
