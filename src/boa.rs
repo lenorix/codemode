@@ -201,15 +201,13 @@ async fn run_inner(
             PromiseState::Fulfilled(_) => {
                 exported_value(&module, &mut context, limits.max_output_bytes)
             }
-            // Render the rejection via JS string. RuntimeLimit errors are special
-            // and can't be made opaque, so don't try.
-            PromiseState::Rejected(err) => {
-                let message = err
-                    .to_string(&mut context)
-                    .map(|s| s.to_std_string_escaped())
-                    .unwrap_or_else(|_| "uncaught exception".to_string());
-                Err(classify(message))
-            }
+            // Render the rejection reason WITHOUT invoking user code. This match
+            // runs after the wall-clock deadline, so calling `to_string` on an
+            // attacker-thrown object would execute its `toString`/`valueOf`/
+            // `Symbol.toPrimitive` here, unbounded past the timeout (the same
+            // post-deadline hazard `result_convertible` guards on the fulfilled
+            // path). `render_rejection` reads stored properties only.
+            PromiseState::Rejected(err) => Err(classify(render_rejection(&err, &mut context))),
             PromiseState::Pending => Err(ExecError::Exception {
                 message: "module did not finish executing".to_string(),
             }),
@@ -217,9 +215,11 @@ async fn run_inner(
     }
     .await;
 
+    // Move the captured logs out (the RunState is discarded right after), rather
+    // than cloning the whole Vec<String>.
     let logs = context
         .remove_data::<RunState>()
-        .map(|state| state.logs.borrow().clone())
+        .map(|state| std::mem::take(&mut *state.logs.borrow_mut()))
         .unwrap_or_default();
     (result, logs)
 }
@@ -399,6 +399,40 @@ fn classify(message: String) -> ExecError {
         ExecError::Limit { what: message }
     } else {
         ExecError::Exception { message }
+    }
+}
+
+/// Render a promise rejection reason to a string WITHOUT invoking user code.
+/// This runs after the wall-clock deadline (the `match promise.state()` in
+/// `run_inner` is outside the timeout), so calling `to_string`/`to_primitive` on
+/// an object reason would execute an attacker's `toString`/`valueOf`/
+/// `Symbol.toPrimitive` unbounded past the timeout, the same post-deadline hazard
+/// `result_convertible` guards against on the fulfilled path. For an object we
+/// read only its stored `name`/`message` data properties (accessors and Proxy
+/// traps yield nothing); for a primitive, `to_string` converts directly and runs
+/// no user code.
+fn render_rejection(err: &JsValue, context: &mut Context) -> String {
+    let Some(obj) = err.as_object() else {
+        return err
+            .to_string(context)
+            .map(|s| s.to_std_string_escaped())
+            .unwrap_or_else(|_| "uncaught exception".to_string());
+    };
+    let data_string = |key: JsString| -> Option<String> {
+        obj.borrow()
+            .properties()
+            .get(&key.into())
+            .and_then(|d| d.value().cloned())
+            .and_then(|v| v.as_string().map(|s| s.to_std_string_escaped()))
+    };
+    match (
+        data_string(js_string!("name")),
+        data_string(js_string!("message")),
+    ) {
+        (Some(name), Some(message)) => format!("{name}: {message}"),
+        (None, Some(message)) => message,
+        (Some(name), None) => name,
+        (None, None) => "uncaught exception (non-error throw)".to_string(),
     }
 }
 
@@ -1225,6 +1259,46 @@ mod tests {
             outcome.error
         );
         assert_eq!(outcome.result, json!({ "trigger": null, "payload": 1 }));
+    }
+
+    #[test]
+    fn rejection_reason_tostring_is_not_invoked() {
+        // The rejection-rendering arm runs after the wall-clock deadline, so a
+        // thrown object's `toString` must NOT run there (it would execute user JS
+        // unbounded past the timeout, the same hazard the fulfilled path guards).
+        // We render from the stored `name`/`message` data properties instead. If
+        // `toString` ran, the message would be "TOSTRING-RAN".
+        let outcome = run(
+            "throw { name: 'BadThing', message: 'boom', \
+             toString() { return 'TOSTRING-RAN'; } };\n\
+             export default 1;",
+            vec![],
+            echo_bridge(),
+        );
+        match outcome.error {
+            Some(ExecError::Exception { message }) => {
+                assert!(
+                    message.contains("boom") && message.contains("BadThing"),
+                    "expected the stored name/message, got: {message}"
+                );
+                assert!(
+                    !message.contains("TOSTRING-RAN"),
+                    "toString was invoked during rejection rendering: {message}"
+                );
+            }
+            other => panic!("expected an Exception, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejection_with_primitive_reason_renders() {
+        // A thrown primitive (no object, no user code) still renders sensibly.
+        let outcome = run("throw 'plain string error';", vec![], echo_bridge());
+        assert!(
+            matches!(&outcome.error, Some(ExecError::Exception { message }) if message.contains("plain string error")),
+            "got: {:?}",
+            outcome.error
+        );
     }
 
     #[test]
