@@ -25,7 +25,7 @@ use boa_engine::{
 
 use crate::runtime::{Bridge, CodeRuntime, RunRequest};
 use crate::source::LocalFuture;
-use crate::types::{Capabilities, ExecError, Limits, Outcome, ServerTools};
+use crate::types::{Capabilities, ExecError, Limits, Outcome, ServerTools, ToolInfo};
 
 /// Per-execution state, attached to the Boa `Context` via host-defined data
 /// (`insert_data`/`get_data`) rather than thread-locals. Each execution owns its
@@ -125,7 +125,9 @@ imported server modules are the only way out.
 Modern JavaScript works (optional chaining, spread, destructuring, template \
 literals, Array/Object/Map/Set/JSON, Promise.all). `Intl` and `structuredClone` \
 are not available; format numbers with `toFixed`. Do the whole task in this one \
-program so only the final result returns.";
+program, and `export default` only the answer the user needs: filter, select, and \
+aggregate inside the code rather than returning raw tool output, so only the \
+final result returns.";
 
 /// Build a fresh context, run `source`, and return `(result, captured logs)`.
 /// Logs are read from the context's `RunState` afterwards, so they're returned
@@ -558,9 +560,7 @@ fn module_source(server: &ServerTools) -> String {
     let server_lit = json_lit(&server.name);
     for (i, tool) in server.tools.iter().enumerate() {
         let tool_lit = json_lit(&tool.name);
-        if let Some(desc) = &tool.description {
-            out.push_str(&format!("/** {} */\n", desc.replace("*/", "* /")));
-        }
+        out.push_str(&jsdoc(tool));
         // Define under an internal identifier, then export under the exact tool
         // name via a string-named export. This works for any name: a normal name
         // like `echo` is still reached as `ns.echo`, an odd one as `ns["a-b"]`,
@@ -575,6 +575,84 @@ fn module_source(server: &ServerTools) -> String {
 
 fn json_lit(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
+}
+
+/// The JSDoc block for one tool: its description plus, when the schema has
+/// properties, a `@param` line describing the single argument object's shape
+/// (field names, rough types, optionality). It documents the generated wrapper
+/// and gives a typed view for any signature consumer; it never reaches the model
+/// as tokens (generated module source isn't sent). Returns "" when there's
+/// nothing to say. The whole body is `*/`-sanitized, so a hostile tool name,
+/// description, or field name can't break out of the comment.
+fn jsdoc(tool: &ToolInfo) -> String {
+    let mut body = String::new();
+    if let Some(desc) = &tool.description {
+        body.push_str(desc);
+    }
+    if let Some(sig) = arg_signature(&tool.input_schema) {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("@param args ");
+        body.push_str(&sig);
+    }
+    if body.is_empty() {
+        return String::new();
+    }
+    let body = body.replace("*/", "* /");
+    let mut out = String::from("/**\n");
+    for line in body.lines() {
+        out.push_str(" * ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(" */\n");
+    out
+}
+
+/// A compact `{ field: type, optional?: type }` view of a tool's single argument
+/// object, derived from the schema's top-level `properties`/`required`. Returns
+/// `None` when there are no properties to describe.
+fn arg_signature(schema: &serde_json::Value) -> Option<String> {
+    let props = schema.get("properties")?.as_object()?;
+    if props.is_empty() {
+        return None;
+    }
+    let required: std::collections::HashSet<&str> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let fields: Vec<String> = props
+        .iter()
+        .map(|(name, spec)| {
+            let opt = if required.contains(name.as_str()) {
+                ""
+            } else {
+                "?"
+            };
+            format!("{name}{opt}: {}", json_type_name(spec))
+        })
+        .collect();
+    Some(format!("{{ {} }}", fields.join(", ")))
+}
+
+/// Map a property schema to a rough JS-ish type name for the JSDoc signature.
+fn json_type_name(spec: &serde_json::Value) -> &'static str {
+    let name = match spec.get("type") {
+        Some(serde_json::Value::String(s)) => s.as_str(),
+        Some(serde_json::Value::Array(a)) => a.iter().find_map(|v| v.as_str()).unwrap_or("any"),
+        _ => return "any",
+    };
+    match name {
+        "string" => "string",
+        "number" | "integer" => "number",
+        "boolean" => "boolean",
+        "array" => "array",
+        "object" => "object",
+        "null" => "null",
+        _ => "any",
+    }
 }
 
 // --- Event loop: a tokio-driven JobExecutor, adapted from Boa's
@@ -817,6 +895,51 @@ mod tests {
         );
         assert!(outcome.error.is_none(), "error: {:?}", outcome.error);
         assert_eq!(outcome.result, json!({ "called": "weird-tool.name" }));
+    }
+
+    #[test]
+    fn module_source_emits_typed_param_signature() {
+        let server = ServerTools {
+            name: "fs".to_string(),
+            tools: vec![ToolInfo {
+                name: "readFile".to_string(),
+                description: Some("Read a file".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "encoding": { "type": "string" },
+                        "lines": { "type": "integer" }
+                    },
+                    "required": ["path"]
+                }),
+            }],
+        };
+        let src = module_source(&server);
+        assert!(src.contains("Read a file"), "missing description: {src}");
+        assert!(
+            src.contains("@param args { path: string, encoding?: string, lines?: number }"),
+            "missing/incorrect signature: {src}"
+        );
+    }
+
+    #[test]
+    fn module_source_sanitizes_comment_breakout_in_field_names() {
+        // A hostile MCP server could name a field to close the JSDoc comment.
+        let server = ServerTools {
+            name: "x".to_string(),
+            tools: vec![ToolInfo {
+                name: "t".to_string(),
+                description: None,
+                input_schema: json!({ "type": "object", "properties": { "*/ evil": { "type": "string" } } }),
+            }],
+        };
+        let src = module_source(&server);
+        // The only `*/` left is the comment terminator, never the injected name.
+        assert!(
+            !src.contains("*/ evil"),
+            "comment breakout not neutralized: {src}"
+        );
     }
 
     #[test]

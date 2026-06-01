@@ -1,7 +1,8 @@
 //! Surface B: use codemode as a dependency inside a [Rig](https://docs.rig.rs)
 //! agent, the `codemode()`-for-Rust shape. Instead of handing the agent every
-//! MCP tool, `.code_mode(&cm)` gives it three tools (discover / find / execute)
-//! and a preamble telling the model to write code.
+//! MCP tool, `.code_mode(&cm)` gives it three tools (discover / find / execute);
+//! the `execute` tool's description carries the guidance that tells the model to
+//! write code.
 //!
 //! ```ignore
 //! use std::sync::Arc;
@@ -34,7 +35,9 @@ use serde::Deserialize;
 use crate::{CodeMode, Error, Outcome, ServerInfo, ToolInfo};
 
 /// Extension on Rig's `AgentBuilder` that registers the three code-execution
-/// tools and appends usage guidance derived from the runtime's capabilities.
+/// tools. The usage guidance rides on the `execute` tool's own description (see
+/// [`ExecuteTool`]), so it isn't also appended to the preamble: duplicating it in
+/// both places would re-send the same guidance twice in every prompt.
 pub trait CodeModeExt<M, P>
 where
     M: CompletionModel,
@@ -49,8 +52,7 @@ where
     P: PromptHook<M>,
 {
     fn code_mode(self, cm: &Arc<CodeMode>) -> AgentBuilder<M, P, WithBuilderTools> {
-        self.append_preamble(&cm.capabilities().usage_guidance)
-            .tool(DiscoverTool(cm.clone()))
+        self.tool(DiscoverTool(cm.clone()))
             .tool(FindTool(cm.clone()))
             .tool(ExecuteTool(cm.clone()))
     }

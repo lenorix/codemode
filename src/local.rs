@@ -162,18 +162,25 @@ impl ToolSource for LocalToolSet {
 /// server name.
 pub(crate) struct CompositeSource {
     sources: Vec<Rc<dyn ToolSource>>,
+    /// server name -> the source that owns it, built once at construction.
+    /// Server names are unique (the builder rejects duplicates), so a flat map
+    /// is enough and avoids rebuilding a name list on every tool call.
+    routes: HashMap<String, Rc<dyn ToolSource>>,
 }
 
 impl CompositeSource {
     pub(crate) fn new(sources: Vec<Rc<dyn ToolSource>>) -> Self {
-        Self { sources }
+        let mut routes = HashMap::new();
+        for source in &sources {
+            for name in source.server_names() {
+                routes.insert(name, source.clone());
+            }
+        }
+        Self { sources, routes }
     }
 
     fn route(&self, server: &str) -> Option<Rc<dyn ToolSource>> {
-        self.sources
-            .iter()
-            .find(|s| s.server_names().iter().any(|n| n == server))
-            .cloned()
+        self.routes.get(server).cloned()
     }
 }
 

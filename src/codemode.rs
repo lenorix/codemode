@@ -353,7 +353,63 @@ async fn find(
     Ok(tools
         .into_iter()
         .filter(|t| allow.allows(server, &t.name))
+        .map(|mut t| {
+            t.input_schema = slim_schema(&t.input_schema);
+            t
+        })
         .collect())
+}
+
+/// Trim presentation and meta keys from a JSON Schema before `find` returns it,
+/// so the model spends fewer tokens on schema boilerplate. Keeps everything that
+/// shapes a call (`properties`, `required`, `items`, `enum`, `type`,
+/// `description`, `$ref`, `$defs`, `anyOf`/`oneOf`/`allOf`, and the like) and
+/// drops keys the model never needs to write the arguments. `$defs`/
+/// `definitions` are kept so any `$ref` still resolves. Recurses through nested
+/// schemas so the trimming reaches sub-objects too.
+///
+/// The keyword drop applies to schema-keyword positions only. `properties`,
+/// `patternProperties`, `$defs`, and `definitions` hold maps whose keys are
+/// caller-chosen names, so a field literally named `title` (or `$schema`, etc.)
+/// is preserved; only the value under each name is slimmed.
+fn slim_schema(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, child) in map {
+                match key.as_str() {
+                    "$schema" | "$id" | "$comment" | "title" => continue,
+                    // additionalProperties is usually the boolean `false`
+                    // boilerplate; drop that, but keep a schema value (it carries
+                    // the value type of a map).
+                    "additionalProperties" if child.is_boolean() => continue,
+                    "properties" | "patternProperties" | "$defs" | "definitions" => {
+                        out.insert(key.clone(), slim_named_schemas(child));
+                    }
+                    _ => {
+                        out.insert(key.clone(), slim_schema(child));
+                    }
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(slim_schema).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Slim a map of named subschemas (the value of `properties`/`$defs`/etc.). The
+/// keys are names chosen by the tool author, so every name is kept verbatim; only
+/// each subschema value is slimmed.
+fn slim_named_schemas(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(name, schema)| (name.clone(), slim_schema(schema)))
+                .collect(),
+        ),
+        other => slim_schema(other),
+    }
 }
 
 /// Run one execution to completion and send its `Outcome` back, holding `_permit`
@@ -392,7 +448,7 @@ async fn run_execution(
 
 async fn execute(
     source: &Rc<dyn ToolSource>,
-    allow: &AllowList,
+    allow: &Rc<AllowList>,
     runtime: &dyn CodeRuntime,
     limits: &Limits,
     code: String,
@@ -459,7 +515,7 @@ async fn exposed_servers(
 /// and scrubs internal error detail before it can reach the model.
 fn make_bridge(
     source: Rc<dyn ToolSource>,
-    allow: AllowList,
+    allow: Rc<AllowList>,
     max_calls: u32,
     per_call: Duration,
     max_output_bytes: usize,
@@ -471,6 +527,7 @@ fn make_bridge(
               args: Value|
               -> crate::source::LocalFuture<std::result::Result<Value, BridgeError>> {
             let source = source.clone();
+            // Cheap Rc clone of the (immutable) allowlist, not a HashMap copy.
             let allow = allow.clone();
             let budget = budget.clone();
             Box::pin(async move {
@@ -618,6 +675,68 @@ mod tests {
             DEFAULT_MAX_CONCURRENT,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn slim_schema_drops_boilerplate_keeps_shape() {
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "ReadFileArgs",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "path": { "type": "string", "description": "the path", "title": "Path" },
+                "encoding": { "type": "string", "enum": ["utf8", "binary"] }
+            },
+            "required": ["path"]
+        });
+        let slim = slim_schema(&schema);
+        // Boilerplate removed, top-level and nested.
+        assert!(slim.get("$schema").is_none());
+        assert!(slim.get("title").is_none());
+        assert!(slim.get("additionalProperties").is_none());
+        assert!(slim["properties"]["path"].get("title").is_none());
+        // Everything that shapes a call is kept.
+        assert_eq!(slim["type"], json!("object"));
+        assert_eq!(slim["required"], json!(["path"]));
+        assert_eq!(slim["properties"]["path"]["type"], json!("string"));
+        assert_eq!(slim["properties"]["path"]["description"], json!("the path"));
+        assert_eq!(
+            slim["properties"]["encoding"]["enum"],
+            json!(["utf8", "binary"])
+        );
+    }
+
+    #[test]
+    fn slim_schema_keeps_additional_properties_schema() {
+        // A schema-valued additionalProperties carries a map's value type, so keep it.
+        let schema = json!({ "type": "object", "additionalProperties": { "type": "number" } });
+        let slim = slim_schema(&schema);
+        assert_eq!(slim["additionalProperties"]["type"], json!("number"));
+    }
+
+    #[test]
+    fn slim_schema_keeps_properties_named_like_keywords() {
+        // The keyword drop must not strip a field literally named `title` (or
+        // `$schema`, etc.): inside `properties` those are caller-chosen names.
+        let schema = json!({
+            "type": "object",
+            "title": "CreatePage",
+            "properties": {
+                "title": { "type": "string", "title": "Page title" },
+                "$schema": { "type": "string" }
+            },
+            "required": ["title"]
+        });
+        let slim = slim_schema(&schema);
+        // The schema-level `title` annotation is dropped...
+        assert!(slim.get("title").is_none());
+        // ...but the fields named `title` and `$schema` survive (their own
+        // nested `title` annotation is still trimmed).
+        assert_eq!(slim["properties"]["title"]["type"], json!("string"));
+        assert!(slim["properties"]["title"].get("title").is_none());
+        assert_eq!(slim["properties"]["$schema"]["type"], json!("string"));
+        assert_eq!(slim["required"], json!(["title"]));
     }
 
     #[tokio::test]

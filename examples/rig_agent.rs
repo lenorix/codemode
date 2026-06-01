@@ -3,8 +3,9 @@
 //! This is the ergonomics demo, the integration the README promises. We build a
 //! `CodeMode` over a small in-Rust "store" server, then call `.code_mode(&cm)` on
 //! a Rig `AgentBuilder`. That single call registers the discover / find / execute
-//! tools and appends the usage guidance, so the model answers by writing one JS
-//! program instead of chaining tool calls. There is no measurement here on
+//! tools (the usage guidance rides on the execute tool's description), so the
+//! model answers by writing one JS program instead of chaining tool calls.
+//! There is no measurement here on
 //! purpose; if you want the token and latency numbers behind code mode, that's
 //! `token_savings.rs`, which hand-rolls its own loop so it can count them.
 //!
