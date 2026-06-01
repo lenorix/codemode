@@ -163,7 +163,14 @@ pub(crate) fn serialized_within(value: &serde_json::Value, max: usize) -> bool {
 /// a deeper value could overflow the stack and abort the process; this keeps
 /// such conversions comfortably within the stack. Real JSON rarely nests past a
 /// few dozen levels.
-pub(crate) const MAX_JSON_DEPTH: usize = 256;
+///
+/// Kept below `serde_json`'s default 128-level recursion limit so a value the
+/// bridge accepts always survives a re-parse on the wire: the subprocess worker
+/// deserializes each reply with `serde_json` (one level of which is the protocol
+/// envelope), so a result the in-process backend accepts must also parse there.
+/// This makes both backends reject over-deep results identically (a clean depth
+/// error) instead of one of them hanging on a reply that won't parse.
+pub(crate) const MAX_JSON_DEPTH: usize = 120;
 
 /// True if `value` nests no deeper than `max`, checked iteratively (so the check
 /// itself can't overflow) and along the current path only (so a wide-but-shallow

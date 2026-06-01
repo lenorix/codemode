@@ -14,6 +14,8 @@
 //! The worker caps its own address space and CPU (see `run_worker`) using the
 //! safe `rlimit` wrapper, so there is no `unsafe` and no `pre_exec` here.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -24,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 
 use crate::boa::Boa;
 use crate::runtime::{Bridge, BridgeError, CodeRuntime, RunRequest};
@@ -95,8 +97,10 @@ impl From<WireLimits> for Limits {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum FromWorker {
-    /// A tool call the parent must service.
+    /// A tool call the parent must service. `id` correlates the reply, so several
+    /// calls (e.g. a `Promise.all`) can be in flight and answered out of order.
     Call {
+        id: u64,
         server: String,
         tool: String,
         args: Value,
@@ -105,12 +109,13 @@ enum FromWorker {
     Done { outcome: Outcome },
 }
 
-/// Lines the parent writes to the worker's stdin in response to a `Call`.
+/// Lines the parent writes to the worker's stdin in response to a `Call`. The
+/// `id` echoes the call it answers.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ToWorker {
-    Ok { value: Value },
-    Err { message: String },
+    Ok { id: u64, value: Value },
+    Err { id: u64, message: String },
 }
 
 // --- Parent side ---
@@ -198,31 +203,34 @@ async fn run_parent(worker: PathBuf, max_memory_bytes: u64, request: RunRequest)
         let _ = child.kill().await;
         return failed(format!("could not send job to worker: {e}"));
     }
+    // Share stdin so several concurrent reply-writers can use it; each holds the
+    // lock only for its own line.
+    let stdin = Rc::new(Mutex::new(stdin));
 
     // Kill the child if it outlives the deadline (covers synchronous CPU, which
     // the in-process engine can't bound). Small margin over the run's own timeout.
     let deadline = request.limits.timeout + Duration::from_secs(2);
-    let outcome = match tokio::time::timeout(
-        deadline,
-        pump(&mut stdout, &mut stdin, &request.bridge),
-    )
-    .await
-    {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(e)) => failed(e),
-        Err(_) => Outcome::failed(ExecError::Timeout, Vec::new()),
-    };
+    let outcome =
+        match tokio::time::timeout(deadline, pump(&mut stdout, stdin, &request.bridge)).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(e)) => failed(e),
+            Err(_) => Outcome::failed(ExecError::Timeout, Vec::new()),
+        };
     let _ = child.kill().await;
     outcome
 }
 
 /// Service the worker's tool calls until it reports a result, or it exits early
-/// (e.g. killed by a resource limit).
+/// (e.g. killed by a resource limit). Each `Call` is serviced on its own task so
+/// a program's `Promise.all` of N tool calls overlaps instead of serializing on
+/// one round-trip; replies carry the call's `id` so out-of-order answers route
+/// correctly on the worker side.
 async fn pump(
     stdout: &mut BufReader<tokio::process::ChildStdout>,
-    stdin: &mut tokio::process::ChildStdin,
+    stdin: Rc<Mutex<tokio::process::ChildStdin>>,
     bridge: &Bridge,
 ) -> Result<Outcome, String> {
+    let mut in_flight: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     loop {
         let line = match read_line_capped(stdout, MAX_LINE_BYTES).await {
             Ok(Some(line)) => line,
@@ -235,18 +243,37 @@ async fn pump(
             Err(e) => return Err(format!("reading from worker: {e}")),
         };
         match serde_json::from_str::<FromWorker>(&line).map_err(|e| e.to_string())? {
-            FromWorker::Done { outcome } => return Ok(outcome),
-            FromWorker::Call { server, tool, args } => {
-                let reply = match bridge(server, tool, args).await {
-                    Ok(value) => ToWorker::Ok { value },
-                    Err(e) => ToWorker::Err {
-                        message: e.to_string(),
-                    },
-                };
-                let line = serde_json::to_string(&reply).map_err(|e| e.to_string())?;
-                write_line(stdin, &line)
-                    .await
-                    .map_err(|e| format!("writing to worker: {e}"))?;
+            FromWorker::Done { outcome } => {
+                // The worker reports Done only after its program (and thus every
+                // awaited tool call) has resolved, so every reply has already been
+                // written. Drain the writer tasks to surface a write error and
+                // avoid dropping one mid-write.
+                for task in in_flight.drain(..) {
+                    let _ = task.await;
+                }
+                return Ok(outcome);
+            }
+            FromWorker::Call {
+                id,
+                server,
+                tool,
+                args,
+            } => {
+                let bridge = bridge.clone();
+                let stdin = stdin.clone();
+                in_flight.push(tokio::task::spawn_local(async move {
+                    let reply = match bridge(server, tool, args).await {
+                        Ok(value) => ToWorker::Ok { id, value },
+                        Err(e) => ToWorker::Err {
+                            id,
+                            message: e.to_string(),
+                        },
+                    };
+                    if let Ok(line) = serde_json::to_string(&reply) {
+                        let mut writer = stdin.lock().await;
+                        let _ = write_line(&mut *writer, &line).await;
+                    }
+                }));
             }
         }
     }
@@ -317,14 +344,15 @@ fn apply_resource_limits(max_memory_bytes: u64, cpu_seconds: u64) {
 
 // --- Worker side (the child process) ---
 
-struct WorkerIo {
-    reader: BufReader<tokio::io::Stdin>,
-    stdout: tokio::io::Stdout,
-}
+/// Worker-side map of in-flight tool calls: the reply for each `id` is delivered
+/// through its oneshot. `Ok(value)`/`Err(message)` mirror `ToWorker`.
+type Pending = Rc<RefCell<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
 /// Entry point for the `__worker` subcommand. Reads one `Job`, caps its own
 /// resources, runs Boa with a bridge that proxies tool calls back to the parent,
-/// and writes the `Outcome`.
+/// and writes the `Outcome`. A background task reads the parent's replies and
+/// routes each to the call awaiting its `id`, so a program's concurrent tool
+/// calls overlap instead of serializing on a single round-trip.
 pub async fn run_worker() {
     let mut reader = BufReader::new(tokio::io::stdin());
     let job: Job = match read_line_capped(&mut reader, MAX_LINE_BYTES).await {
@@ -343,11 +371,46 @@ pub async fn run_worker() {
         (job.limits.timeout_ms / 1000).max(1).saturating_add(2),
     );
 
-    let io = Rc::new(Mutex::new(WorkerIo {
-        reader,
-        stdout: tokio::io::stdout(),
-    }));
-    let bridge = remote_bridge(io.clone());
+    // Write-locked stdout for outgoing Call/Done lines (the lock is held only per
+    // line), and a pending map so out-of-order replies reach the right waiter.
+    let stdout = Rc::new(Mutex::new(tokio::io::stdout()));
+    let pending: Pending = Rc::new(RefCell::new(HashMap::new()));
+    let next_id = Rc::new(Cell::new(0u64));
+
+    // Route each parent reply to its waiting call. On EOF (parent closed), the
+    // loop ends; remaining senders drop, so any pending `rx.await` resolves to an
+    // error rather than hanging.
+    {
+        let pending = pending.clone();
+        tokio::task::spawn_local(async move {
+            // Loop ends on EOF or read error (the parent is gone); the inner
+            // `Err(_) => break` stops on a corrupt reply (the stream is desynced,
+            // so don't risk mis-routing later lines).
+            while let Ok(Some(line)) = read_line_capped(&mut reader, MAX_LINE_BYTES).await {
+                match serde_json::from_str::<ToWorker>(line.trim()) {
+                    Ok(ToWorker::Ok { id, value }) => {
+                        if let Some(tx) = pending.borrow_mut().remove(&id) {
+                            let _ = tx.send(Ok(value));
+                        }
+                    }
+                    Ok(ToWorker::Err { id, message }) => {
+                        if let Some(tx) = pending.borrow_mut().remove(&id) {
+                            let _ = tx.send(Err(message));
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // The reply stream ended (EOF, read error, or a corrupt line): fail
+            // every call still waiting, so its `rx.await` returns an error instead
+            // of hanging until the parent's wall-clock kill.
+            for (_, tx) in pending.borrow_mut().drain() {
+                let _ = tx.send(Err("worker connection closed".to_string()));
+            }
+        });
+    }
+
+    let bridge = remote_bridge(stdout.clone(), pending, next_id);
 
     let outcome = Boa::new()
         .run(RunRequest::new(
@@ -358,40 +421,51 @@ pub async fn run_worker() {
         ))
         .await;
 
-    let mut io = io.lock().await;
     if let Ok(line) = serde_json::to_string(&FromWorker::Done { outcome }) {
-        let _ = write_line(&mut io.stdout, &line).await;
+        let mut writer = stdout.lock().await;
+        let _ = write_line(&mut *writer, &line).await;
     }
 }
 
-/// A bridge that turns each tool call into a round-trip with the parent. Calls
-/// are serialized (one in flight at a time) so the protocol needs no request ids.
-fn remote_bridge(io: Rc<Mutex<WorkerIo>>) -> Bridge {
+/// A bridge that turns each tool call into a round-trip with the parent: assign
+/// an `id`, register a waiter, write the `Call`, and await the matching reply.
+/// The stdout lock is held only for the write, never across the wait, so a
+/// `Promise.all` of calls overlaps.
+fn remote_bridge(
+    stdout: Rc<Mutex<tokio::io::Stdout>>,
+    pending: Pending,
+    next_id: Rc<Cell<u64>>,
+) -> Bridge {
     Rc::new(move |server: String, tool: String, args: Value| {
-        let io = io.clone();
+        let stdout = stdout.clone();
+        let pending = pending.clone();
+        let id = next_id.get();
+        next_id.set(id.wrapping_add(1));
         Box::pin(async move {
-            let mut io = io.lock().await;
-            let call = serde_json::to_string(&FromWorker::Call { server, tool, args })
-                .map_err(|e| BridgeError::Call(e.to_string()))?;
-            write_line(&mut io.stdout, &call)
-                .await
-                .map_err(|e| BridgeError::Call(e.to_string()))?;
-
-            let WorkerIo { reader, .. } = &mut *io;
-            let line = match read_line_capped(reader, MAX_LINE_BYTES).await {
-                Ok(Some(line)) => line,
-                Ok(None) => {
-                    return Err(BridgeError::Call(
-                        "parent closed the connection".to_string(),
-                    ));
-                }
-                Err(e) => return Err(BridgeError::Call(e.to_string())),
-            };
-            match serde_json::from_str::<ToWorker>(line.trim())
-                .map_err(|e| BridgeError::Call(e.to_string()))?
+            let call = serde_json::to_string(&FromWorker::Call {
+                id,
+                server,
+                tool,
+                args,
+            })
+            .map_err(|e| BridgeError::Call(e.to_string()))?;
+            // Register the waiter before writing: the single-threaded reader task
+            // can only look up this id after the (synchronous) insert has run.
+            let (tx, rx) = oneshot::channel();
+            pending.borrow_mut().insert(id, tx);
             {
-                ToWorker::Ok { value } => Ok(value),
-                ToWorker::Err { message } => Err(BridgeError::Call(message)),
+                let mut writer = stdout.lock().await;
+                if let Err(e) = write_line(&mut *writer, &call).await {
+                    pending.borrow_mut().remove(&id);
+                    return Err(BridgeError::Call(e.to_string()));
+                }
+            }
+            match rx.await {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(message)) => Err(BridgeError::Call(message)),
+                Err(_) => Err(BridgeError::Call(
+                    "parent closed the connection".to_string(),
+                )),
             }
         }) as LocalFuture<_>
     })

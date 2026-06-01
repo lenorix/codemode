@@ -401,6 +401,12 @@ fn slim_schema(value: &Value) -> Value {
                     "properties" | "patternProperties" | "$defs" | "definitions" => {
                         out.insert(key.clone(), slim_named_schemas(child));
                     }
+                    // These hold literal data (example/default/allowed instances),
+                    // not subschemas, so copy them verbatim: recursing would strip
+                    // keyword-named keys (e.g. a `title` field) from a value.
+                    "enum" | "const" | "default" | "examples" => {
+                        out.insert(key.clone(), child.clone());
+                    }
                     _ => {
                         out.insert(key.clone(), slim_schema(child));
                     }
@@ -752,6 +758,32 @@ mod tests {
         assert!(slim["properties"]["title"].get("title").is_none());
         assert_eq!(slim["properties"]["$schema"]["type"], json!("string"));
         assert_eq!(slim["required"], json!(["title"]));
+    }
+
+    #[test]
+    fn slim_schema_preserves_data_bearing_keyword_values() {
+        // enum/const/default/examples hold literal data, not subschemas, so a value
+        // with a keyword-named key (title/$id/$schema/$comment) must survive intact
+        // rather than be slimmed to {}.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "object",
+                    "default": { "title": "Untitled", "$id": "x" },
+                    "enum": [ { "title": "Mr" }, { "$schema": "y" } ],
+                    "const": { "$comment": "c" }
+                }
+            }
+        });
+        let slim = slim_schema(&schema);
+        let mode = &slim["properties"]["mode"];
+        assert_eq!(mode["default"], json!({ "title": "Untitled", "$id": "x" }));
+        assert_eq!(
+            mode["enum"],
+            json!([ { "title": "Mr" }, { "$schema": "y" } ])
+        );
+        assert_eq!(mode["const"], json!({ "$comment": "c" }));
     }
 
     #[tokio::test]
