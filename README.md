@@ -25,8 +25,8 @@ in-Rust tools) and give a Rig agent the three-tool surface instead of every tool
 
 ```rust
 use std::sync::Arc;
-use codemode_mcp::{CodeMode, ServerConfig};
-use codemode_mcp::rig::CodeModeExt;
+use codemode::{CodeMode, ServerConfig};
+use codemode::rig::CodeModeExt;
 
 let cm = Arc::new(
     CodeMode::builder()
@@ -38,6 +38,11 @@ let cm = Arc::new(
 
 let agent = client.agent(model).preamble("…").code_mode(&cm).build();
 ```
+
+> Expose only the tools you trust the model to compose: the sandbox isolates compute, not capability,
+> so injected code can chain any tools you allow (a read tool plus a write/send tool can exfiltrate).
+> Keep the allowlist least-privilege. For untrusted/prompt-injected input, prefer the `subprocess`
+> runtime for hard OS isolation. See [security](docs/security.md).
 
 As a **standalone MCP server** any host can configure:
 
@@ -55,7 +60,12 @@ As a **standalone MCP server** any host can configure:
 cargo test # the full suite
 cargo run --bin codemode-mcp -- tools --config servers.toml   # list the exposed servers and tools
 cargo run --example token_savings # token usage: traditional vs. code mode (needs a local LLM)
+cargo run --example rig_agent --features rig-example # the same task through a Rig agent (needs a local LLM)
 ```
+
+The `rig_agent` example is the Surface B story end to end: a few lines wire `CodeMode` into a Rig
+agent with `.code_mode(&cm)`. The `rig` feature is just the adapter (you bring your own provider);
+`rig-example` additionally pulls rig-core's openai provider so the example can reach a local server.
 
 The `token_savings` example runs the same task both ways against a local OpenAI-compatible model and
 reports, for each, the tokens, the number of LLM turns, and the wall-clock time. The task is a

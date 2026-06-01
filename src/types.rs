@@ -46,7 +46,7 @@ pub struct Capabilities {
     pub hard_memory_cap: bool,
     /// The LLM-facing rules the surfaces put in front of the model (how to import
     /// servers, how to return a value, language caveats). Never hardcoded by the
-    /// agnostic layer — it comes from here.
+    /// agnostic layer; it comes from here.
     pub usage_guidance: String,
 }
 
@@ -114,6 +114,7 @@ pub struct Outcome {
 }
 
 impl Outcome {
+    /// A successful run: the returned `result` and captured `logs`, no error.
     pub fn ok(result: serde_json::Value, logs: Vec<String>) -> Self {
         Self {
             result,
@@ -122,6 +123,8 @@ impl Outcome {
         }
     }
 
+    /// A failed run: the execution-level `error` and any `logs` captured before
+    /// it, with a null result.
     pub fn failed(error: ExecError, logs: Vec<String>) -> Self {
         Self {
             result: serde_json::Value::Null,
@@ -155,13 +158,63 @@ pub(crate) fn serialized_within(value: &serde_json::Value, max: usize) -> bool {
     serde_json::to_writer(Sink { written: 0, max }, value).is_ok()
 }
 
+/// Max JSON nesting depth we'll convert or serialize. Both `serde_json`
+/// serialization and `JsValue::from_json` recurse one native frame per level, so
+/// a deeper value could overflow the stack and abort the process; this keeps
+/// such conversions comfortably within the stack. Real JSON rarely nests past a
+/// few dozen levels.
+pub(crate) const MAX_JSON_DEPTH: usize = 256;
+
+/// True if `value` nests no deeper than `max`, checked iteratively (so the check
+/// itself can't overflow) and along the current path only (so a wide-but-shallow
+/// value can't blow up memory). Used to vet a tool result before code that
+/// recurses over it (the size-cap serializer, `JsValue::from_json`).
+pub(crate) fn json_depth_within(value: &serde_json::Value, max: usize) -> bool {
+    use serde_json::Value;
+    enum Frame<'a> {
+        Array(std::slice::Iter<'a, Value>),
+        Object(serde_json::map::Values<'a>),
+    }
+    fn frame(value: &Value) -> Option<Frame<'_>> {
+        match value {
+            Value::Array(a) => Some(Frame::Array(a.iter())),
+            Value::Object(o) => Some(Frame::Object(o.values())),
+            _ => None,
+        }
+    }
+    // `stack.len()` is the current nesting depth (the root container is depth 1).
+    let mut stack: Vec<Frame> = frame(value).into_iter().collect();
+    while !stack.is_empty() {
+        let next = match stack.last_mut() {
+            Some(Frame::Array(it)) => it.next(),
+            Some(Frame::Object(it)) => it.next(),
+            None => break,
+        };
+        match next {
+            None => {
+                stack.pop();
+            }
+            Some(child) => {
+                if let Some(child_frame) = frame(child) {
+                    if stack.len() + 1 > max {
+                        return false;
+                    }
+                    stack.push(child_frame);
+                }
+            }
+        }
+    }
+    true
+}
+
 /// An execution-level error, visible to the model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ExecError {
-    /// A thrown or uncaught JavaScript error.
-    Js { message: String },
+    /// An uncaught exception thrown by the code, or another execution-level
+    /// error carrying a message (language-neutral; e.g. a JS `throw` in Boa).
+    Exception { message: String },
     /// The wall-clock deadline elapsed.
     Timeout,
     /// A structural limit tripped (loop iterations, recursion, tool-call budget).

@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use codemode_mcp::{CodeMode, Config};
+use codemode::{CodeMode, Config};
 use rmcp::ErrorData;
 use rmcp::ServiceExt;
 use rmcp::handler::server::ServerHandler;
@@ -61,7 +61,7 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        tokio::task::LocalSet::new().block_on(&rt, codemode_mcp::subprocess::run_worker());
+        tokio::task::LocalSet::new().block_on(&rt, codemode::subprocess::run_worker());
         return ExitCode::SUCCESS;
     }
 

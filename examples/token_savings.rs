@@ -1,35 +1,35 @@
 //! Token usage and latency: traditional tool-calling vs. code mode.
 //!
-//! A small but production-shaped task: a "restock-priority" report over a
-//! catalog, where answering means chaining five tools per product (list, then
-//! reviews, inventory, pricing, sales) and filtering and ranking the result.
-//! This is the kind of multi-tool pipeline a real agent runs, and it is where
-//! the two strategies diverge sharply.
+//! The same multi-tool task (a top-sellers report needing five tools per
+//! product) is run two ways against a local OpenAI-compatible LLM, reporting
+//! tokens, LLM turns, and wall-clock time for each:
 //!
-//! Runs the *same* task two ways against a local OpenAI-compatible LLM and
-//! reports, for each, the total tokens, the number of LLM turns, and the
-//! wall-clock time split into LLM time and tool time:
+//!   1. Traditional: the model calls tools one by one, re-tokenizing every
+//!      intermediate result on each turn.
+//!   2. Code mode: the model writes one program (via `execute`) that chains the
+//!      calls itself; only the final result returns to the model.
 //!
-//!   1. Traditional: the model calls tools one by one; every intermediate
-//!      result is fed back into its context and re-tokenized on each turn.
-//!   2. Code mode: the model writes one program (via the `execute` tool) that
-//!      chains the calls itself; only the final result returns to the model.
+//! The tools and data are identical; only the orchestration differs.
 //!
-//! Each LLM turn is a network round-trip, so fewer turns means lower latency.
-//! Code mode collapses the orchestration into a single turn, so it should win
-//! on both tokens and time even though the tool work itself is identical.
+//! Why this hand-rolls the OpenAI request/response loop instead of using Rig:
+//! the whole point here is to measure, the token total, the number of LLM turns,
+//! and the wall-clock time split into LLM time and tool time, so we can compare
+//! traditional tool-calling against code mode fairly. Rig owns the agent loop
+//! internally and doesn't surface per-turn token usage or a turn count you can
+//! tally, so a fair side-by-side needs raw control over each request and reply.
+//! That control is what makes this file longer than you might expect: the small
+//! chat client, the history and turn bookkeeping, and the metrics are all here in
+//! service of the measurement. If you instead want to see how codemode drops into
+//! a real agent, `rig_agent.rs` is the ergonomics demo (a few lines, no metrics).
 //!
-//! Start an OpenAI-compatible server (e.g. LM Studio) at 127.0.0.1:1234, then:
+//! Start a server (e.g. LM Studio) at 127.0.0.1:1234, then:
 //!
 //!   cargo run --example token_savings
-//!
-//! The tools and their data are identical across both runs — the only thing
-//! that changes is whether the model orchestrates them by calling or by coding.
 
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use codemode_mcp::{CodeMode, LocalTools};
+use codemode::{CodeMode, LocalTools};
 use serde_json::{Value, json};
 
 const ENDPOINT: &str = "http://127.0.0.1:1234/v1/chat/completions";
@@ -38,11 +38,8 @@ const MAX_TURNS: usize = 25;
 
 // --- The shared dataset and tool handlers (used by BOTH runs) ---
 
-/// The product catalog, loaded from `catalog.json` next to this example. Each
-/// record holds everything about a product; the five tools below each expose a
-/// different slice of it, the way separate MCP servers would. Keeping the data
-/// in JSON keeps this file about the comparison, not the fixtures, and lets
-/// other examples reuse the same dataset.
+/// The product catalog (see `catalog.json`); the five tools each expose a slice
+/// of it, the way separate MCP servers would.
 static CATALOG: LazyLock<Value> = LazyLock::new(|| {
     serde_json::from_str(include_str!("catalog.json")).expect("catalog.json is valid JSON")
 });
@@ -68,9 +65,8 @@ fn list_products() -> Value {
 }
 
 fn get_reviews(product_id: &str) -> Value {
-    // This data re-enters the model's context on every turn of the traditional
-    // run, but never does in code mode. Across products and the five tools, the
-    // accumulated results are what dominate the traditional run's token bill.
+    // The bulkiest slice: in the traditional run this re-enters the context on
+    // every turn, which is what dominates its token bill.
     product(product_id)
         .map(|p| p["reviews"].clone())
         .unwrap_or_else(|| json!([]))
@@ -99,7 +95,7 @@ fn get_sales(product_id: &str) -> Value {
 
 const TASK: &str = "Produce a top-sellers report. Among products whose average review rating is at least \
     4.5 and that are currently in stock, list the top three by 30-day units sold, best first, each \
-    formatted as \"<name> — <units> units at $<price>\" (price in whole dollars).";
+    formatted as \"<name> - <units> units at $<price>\" (price in whole dollars).";
 
 // --- Minimal OpenAI chat client ---
 
@@ -109,9 +105,8 @@ async fn chat(
     tools: &Value,
 ) -> Result<(Value, u64), String> {
     let body = json!({
-        // Thinking models (qwen, gpt-oss) emit a long reasoning trace before the
-        // visible answer; too small a cap truncates mid-reasoning and the turn
-        // comes back with empty content. Give them room to finish and answer.
+        // Thinking models need room to finish reasoning before answering; too
+        // small a cap truncates mid-trace and the turn returns empty content.
         "model": MODEL, "messages": messages, "tools": tools,
         "temperature": 0, "max_tokens": 8000
     });
@@ -124,7 +119,7 @@ async fn chat(
             let kind = if e.is_timeout() {
                 " (timed out)"
             } else if e.is_connect() {
-                " (could not connect — is the LLM server running?)"
+                " (could not connect, is the LLM server running?)"
             } else {
                 ""
             };
@@ -139,18 +134,11 @@ async fn chat(
     Ok((message, tokens))
 }
 
-/// The assistant turn to replay into history: `content`, any `tool_calls`, and
-/// crucially the model's reasoning field (`reasoning` / `reasoning_content`).
-/// Thinking models such as qwen put their plan and partial results in reasoning
-/// and leave `content` empty while they work through tool calls. Dropping it
-/// erases their memory of progress, so they re-issue the same calls every turn
-/// and never reach an answer; replaying it keeps the multi-step plan coherent.
-///
-/// This is not a crutch for the comparison: it is what a real agent framework
-/// does. Rig preserves the reasoning block in the assistant history it resends
-/// (rig-core agent/prompt_request pushes the full assistant turn; the deepseek
-/// and moonshot providers read and re-serialize `reasoning_content`, with a test
-/// asserting it). So this mirrors normal agent behaviour rather than inventing it.
+/// The assistant turn to replay into history. We keep the reasoning field
+/// (`reasoning` / `reasoning_content`) alongside `content` and `tool_calls`:
+/// thinking models leave `content` empty while working and track progress in
+/// reasoning, so dropping it makes them re-issue the same calls forever. Real
+/// agent frameworks resend it too (rig-core does), so this isn't a crutch.
 fn history_entry(message: &Value) -> Value {
     let mut entry = json!({ "role": "assistant", "content": message["content"].clone() });
     for field in ["reasoning", "reasoning_content"] {

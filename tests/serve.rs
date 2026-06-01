@@ -1,6 +1,6 @@
 //! End-to-end test of Surface A: spawn the `codemode-mcp serve` binary, connect
 //! to it as an MCP client (the host's role), and exercise the three tools. No
-//! downstream server needed — `execute` runs pure JS — so this is deterministic
+//! downstream server needed, `execute` runs pure JS, so this is deterministic
 //! and needs no network.
 
 #![cfg(feature = "cli")]

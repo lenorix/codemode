@@ -27,14 +27,14 @@ struct Launch {
 pub(crate) struct McpClient {
     launch: Vec<Launch>,
     connections: RefCell<HashMap<String, RunningService<RoleClient, ()>>>,
-    // Serializes the connect path so two concurrent first-uses of the same
-    // server don't each spawn a child process (the second would overwrite and
-    // orphan the first). Connects are rare (once per server), so one shared lock
-    // is enough and simpler than a per-server cell.
+    /// Serializes the connect path so two concurrent first-uses of the same
+    /// server don't each spawn a child process (the second would overwrite and
+    /// orphan the first). Connects are rare (once per server), so one shared lock
+    /// is enough and simpler than a per-server cell.
     connect_lock: tokio::sync::Mutex<()>,
-    // Configured env values, redacted from every error string so a downstream
-    // spawn/transport error can't carry a credential — not to the model and not
-    // to the operator's stderr. See [`McpClient::scrub`].
+    /// Secret-ish config (env values, command, args) redacted from error strings
+    /// as best-effort defense-in-depth; the real control is that none of it leaves
+    /// the child process. See [`McpClient::scrub`].
     secrets: Vec<String>,
 }
 
@@ -49,11 +49,19 @@ impl McpClient {
                 env: s.env.clone(),
             })
             .collect();
-        // Only non-trivial values are worth redacting; very short ones would
-        // over-redact (e.g. an env value of "1" appearing incidentally).
+        // Redact configured env values, command, and args, since tokens are commonly
+        // passed as an arg (`--token SECRET`) or an env value. Only non-trivial
+        // values are worth redacting; very short ones would over-redact (e.g. a
+        // value of "1" appearing incidentally).
         let secrets = launch
             .iter()
-            .flat_map(|l| l.env.iter().map(|(_, v)| v.clone()))
+            .flat_map(|l| {
+                l.env
+                    .iter()
+                    .map(|(_, v)| v.clone())
+                    .chain(std::iter::once(l.command.clone()))
+                    .chain(l.args.iter().cloned())
+            })
             .filter(|v| v.len() >= 4)
             .collect();
         Self {
@@ -214,14 +222,21 @@ mod tests {
 
     #[test]
     fn scrubs_configured_secrets_from_errors() {
-        let server = ServerConfig::stdio("api", "run-server", ["--flag"])
+        // Secrets arrive via env *and* via args (`--token SECRET`); both redacted.
+        let server = ServerConfig::stdio("api", "run-server", ["--token", "arg-secret-token"])
             .env("API_TOKEN", "super-secret-token-value");
         let client = McpClient::new(&[server]);
-        let scrubbed = client
-            .scrub("spawn failed: API_TOKEN=super-secret-token-value not accepted".to_string());
+        let scrubbed = client.scrub(
+            "spawn failed: API_TOKEN=super-secret-token-value --token arg-secret-token rejected"
+                .to_string(),
+        );
         assert!(
             !scrubbed.contains("super-secret-token-value"),
-            "secret leaked: {scrubbed}"
+            "env secret leaked: {scrubbed}"
+        );
+        assert!(
+            !scrubbed.contains("arg-secret-token"),
+            "arg secret leaked: {scrubbed}"
         );
         assert!(scrubbed.contains("***"));
     }

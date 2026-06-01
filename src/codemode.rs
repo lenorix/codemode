@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use futures_util::FutureExt;
 use serde_json::Value;
-use tokio::sync::{OnceCell, Semaphore, mpsc, oneshot};
+use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::boa::Boa;
 use crate::config::{Config, ServerConfig};
@@ -100,6 +100,9 @@ impl CodeMode {
                     // are cheap and run inline.
                     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
                     while let Some(command) = rx.recv().await {
+                        // Drop handles of finished executions every iteration so the
+                        // Vec tracks only what's in flight.
+                        tasks.retain(|t| !t.is_finished());
                         match command {
                             Command::Discover(reply) => {
                                 let _ = reply.send(discover(&source, &allow).await);
@@ -108,43 +111,25 @@ impl CodeMode {
                                 let _ = reply.send(find(&source, &allow, &server).await);
                             }
                             Command::Execute(code, reply) => {
-                                tasks.retain(|t| !t.is_finished());
-                                let (source, runtime, allow, limits, exposed, slots) = (
+                                // Acquire a slot *before* spawning, so the number of
+                                // in-flight executions (each holds a JS context) is
+                                // bounded and the loop applies backpressure here rather
+                                // than letting tasks pile up. The permit moves into the
+                                // task and frees the slot when it finishes. A closed
+                                // semaphore can't happen (we never close it).
+                                let Ok(permit) = slots.clone().acquire_owned().await else {
+                                    continue;
+                                };
+                                tasks.push(tokio::task::spawn_local(run_execution(
+                                    permit,
                                     source.clone(),
                                     runtime.clone(),
                                     allow.clone(),
                                     limits.clone(),
                                     exposed.clone(),
-                                    slots.clone(),
-                                );
-                                tasks.push(tokio::task::spawn_local(async move {
-                                    // Wait for a free slot, then run. A closed
-                                    // semaphore only happens at shutdown.
-                                    let Ok(_permit) = slots.acquire_owned().await else {
-                                        return;
-                                    };
-                                    // Catch a panic inside an execution so it becomes a
-                                    // failed Outcome instead of dropping the reply (which
-                                    // the caller would misread as a dead island).
-                                    let run = AssertUnwindSafe(execute(
-                                        &source,
-                                        &allow,
-                                        runtime.as_ref(),
-                                        &limits,
-                                        code,
-                                        &exposed,
-                                    ));
-                                    let out = run.catch_unwind().await.unwrap_or_else(|_| {
-                                        Outcome::failed(
-                                            ExecError::Js {
-                                                message: "internal error: execution panicked"
-                                                    .to_string(),
-                                            },
-                                            Vec::new(),
-                                        )
-                                    });
-                                    let _ = reply.send(out);
-                                }));
+                                    code,
+                                    reply,
+                                )));
                             }
                             Command::Shutdown(reply) => {
                                 for task in tasks.drain(..) {
@@ -299,6 +284,22 @@ impl CodeModeBuilder {
     }
 
     pub async fn build(self) -> Result<CodeMode> {
+        // Server names must be unique: the allowlist is keyed by name, while the
+        // composite source routes a call to the first source with that name. If a
+        // name collided, the enforced allowlist could bind to a different source
+        // than the call routes to, a deny-by-default hole. Reject it up front.
+        let names = self
+            .servers
+            .iter()
+            .map(|s| s.name.as_str())
+            .chain(self.local.iter().map(|l| l.server()));
+        let mut seen = std::collections::HashSet::new();
+        for name in names {
+            if !seen.insert(name) {
+                return Err(Error::Config(format!("duplicate server name: '{name}'")));
+            }
+        }
+
         let mut allow = AllowList::default();
         for server in &self.servers {
             match &server.allow {
@@ -355,6 +356,40 @@ async fn find(
         .collect())
 }
 
+/// Run one execution to completion and send its `Outcome` back, holding `_permit`
+/// for the duration so the island's concurrency stays bounded. A panic inside the
+/// execution is caught and becomes a failed `Outcome`, so the oneshot reply is
+/// always sent; a dropped reply would make the caller misread the island as dead.
+#[allow(clippy::too_many_arguments)]
+async fn run_execution(
+    _permit: OwnedSemaphorePermit,
+    source: Rc<dyn ToolSource>,
+    runtime: Rc<dyn CodeRuntime + Send>,
+    allow: Rc<AllowList>,
+    limits: Rc<Limits>,
+    exposed: Rc<OnceCell<Vec<ServerTools>>>,
+    code: String,
+    reply: oneshot::Sender<Outcome>,
+) {
+    let run = AssertUnwindSafe(execute(
+        &source,
+        &allow,
+        runtime.as_ref(),
+        &limits,
+        code,
+        &exposed,
+    ));
+    let out = run.catch_unwind().await.unwrap_or_else(|_| {
+        Outcome::failed(
+            ExecError::Exception {
+                message: "internal error: execution panicked".to_string(),
+            },
+            Vec::new(),
+        )
+    });
+    let _ = reply.send(out);
+}
+
 async fn execute(
     source: &Rc<dyn ToolSource>,
     allow: &AllowList,
@@ -370,7 +405,7 @@ async fn execute(
         Ok(servers) => servers.clone(),
         Err(e) => {
             return Outcome::failed(
-                crate::types::ExecError::Js {
+                crate::types::ExecError::Exception {
                     message: e.to_string(),
                 },
                 Vec::new(),
@@ -385,12 +420,7 @@ async fn execute(
         limits.max_output_bytes,
     );
     runtime
-        .run(RunRequest {
-            source: code,
-            servers,
-            bridge,
-            limits: limits.clone(),
-        })
+        .run(RunRequest::new(code, servers, bridge, limits.clone()))
         .await
 }
 
@@ -470,6 +500,15 @@ fn make_bridge(
                         Ok(Ok(value)) => value,
                     };
 
+                // Vet depth before the size check: a deeply nested result would
+                // overflow the native stack inside the size-cap serializer (and
+                // later in the backend's JSON-to-value conversion) and abort the
+                // process. Checked here at the bridge so every backend is covered.
+                if !crate::types::json_depth_within(&result, crate::types::MAX_JSON_DEPTH) {
+                    return Err(BridgeError::Call(
+                        "tool result nests too deeply".to_string(),
+                    ));
+                }
                 if !crate::types::serialized_within(&result, max_output_bytes) {
                     return Err(BridgeError::Call("tool result too large".to_string()));
                 }
@@ -611,6 +650,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deep_tool_result_is_rejected_not_crashing() {
+        // A tool returning a deeply nested result must come back as an error, not
+        // overflow the stack converting/serializing it (which would abort).
+        let cm = CodeMode::builder()
+            .local_tools(LocalTools::new("deep").tool(
+                "get",
+                "deep",
+                serde_json::json!({ "type": "object" }),
+                |_a| async move {
+                    let mut v = serde_json::json!(1);
+                    for _ in 0..1000 {
+                        v = serde_json::json!([v]);
+                    }
+                    Ok(v)
+                },
+            ))
+            .build()
+            .await
+            .unwrap();
+        let outcome = cm
+            .execute("import * as d from './servers/deep'; export default await d.get({});")
+            .await
+            .unwrap();
+        assert!(
+            outcome.error.is_some(),
+            "expected an error, got {outcome:?}"
+        );
+        cm.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_server_names() {
+        // A name shared by two sources would let the allowlist bind to a
+        // different source than the call routes to; build() must refuse it.
+        let result = CodeMode::builder()
+            .server(ServerConfig::stdio("dup", "true", ["x"]))
+            .local_tools(LocalTools::new("dup"))
+            .build()
+            .await;
+        assert!(
+            matches!(result, Err(Error::Config(_))),
+            "expected a Config error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn discover_and_find_respect_the_allowlist() {
         let mut allow = AllowList::default();
         allow.allow("demo", ["echo"]); // secret is NOT exposed
@@ -698,6 +783,63 @@ mod tests {
         assert_eq!(
             *order.lock().unwrap(),
             vec!["fast".to_string(), "slow".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_by_max_concurrent_executions() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::LocalTools;
+
+        // Same slow-then-fast setup as the concurrency test, but with the cap set
+        // to 1. The island acquires a permit before spawning each run, so the fast
+        // execution can't start until the slow one (submitted first) frees its
+        // permit. The cap therefore forces serialization: `slow` finishes first,
+        // the inverse of the concurrent ordering. This asserts the cap bounds
+        // in-flight executions, not just that they can overlap.
+        let order = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (o_slow, o_fast) = (order.clone(), order.clone());
+
+        let cm = Arc::new(
+            CodeMode::builder()
+                .max_concurrent_executions(1)
+                .local_tools(
+                    LocalTools::new("t")
+                        .tool("slow", "", json!({ "type": "object" }), move |_| {
+                            let o = o_slow.clone();
+                            async move {
+                                tokio::time::sleep(Duration::from_millis(120)).await;
+                                o.lock().unwrap().push("slow".to_string());
+                                Ok(json!(1))
+                            }
+                        })
+                        .tool("fast", "", json!({ "type": "object" }), move |_| {
+                            let o = o_fast.clone();
+                            async move {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                                o.lock().unwrap().push("fast".to_string());
+                                Ok(json!(2))
+                            }
+                        }),
+                )
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let (cm1, cm2) = (cm.clone(), cm.clone());
+        let (a, b) = tokio::join!(
+            cm1.execute("import * as t from './servers/t'; export default await t.slow({});"),
+            cm2.execute("import * as t from './servers/t'; export default await t.fast({});"),
+        );
+        assert!(a.unwrap().error.is_none());
+        assert!(b.unwrap().error.is_none());
+
+        // With the cap at 1, `fast` cannot overtake `slow` despite being faster.
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["slow".to_string(), "fast".to_string()]
         );
     }
 
@@ -876,7 +1018,7 @@ mod tests {
             .await
             .unwrap();
         match outcome.error {
-            Some(crate::types::ExecError::Js { message }) => {
+            Some(crate::types::ExecError::Exception { message }) => {
                 assert!(message.contains("JSON"), "got: {message}");
             }
             other => panic!("expected a JS error, got {other:?}"),
@@ -901,7 +1043,7 @@ mod tests {
             .unwrap();
 
         match outcome.error {
-            Some(crate::types::ExecError::Js { message }) => {
+            Some(crate::types::ExecError::Exception { message }) => {
                 assert!(message.contains("not exposed"), "got: {message}");
             }
             other => panic!("expected a JS error, got {other:?}"),

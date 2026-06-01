@@ -26,7 +26,7 @@ struct LocalTool {
 /// [`crate::CodeModeBuilder::local_tools`].
 ///
 /// ```
-/// use codemode_mcp::LocalTools;
+/// use codemode::LocalTools;
 /// use serde_json::json;
 ///
 /// let tools = LocalTools::new("math")

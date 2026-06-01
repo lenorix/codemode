@@ -8,7 +8,7 @@
 //!
 //! # The model: canonical program + backend translation
 //!
-//! The suite owns the *contract* — a fixed, named set of programs
+//! The suite owns the *contract*, a fixed, named set of programs
 //! ([`ConformanceProgram`]) and the language-neutral `Outcome` each must produce.
 //! A backend owns the *translation*: it supplies the source for each program in
 //! its own language. Anything language-specific lives in the translation, never
@@ -21,7 +21,7 @@
 
 use std::rc::Rc;
 
-use codemode_mcp::{
+use codemode::{
     Bridge, CodeRuntime, ExecError, Limits, LocalFuture, Outcome, RunRequest, ServerTools, ToolInfo,
 };
 use serde_json::{Value, json};
@@ -37,8 +37,13 @@ pub enum ConformanceProgram {
     EchoTool,
     /// Throw / raise an exception.
     Throw,
+    /// Return `true` if no ambient host capabilities (fs/net/env/process) are
+    /// reachable from the sandbox.
+    NoHostGlobals,
     /// Loop forever (must be stopped by a limit or the deadline, not hang).
     InfiniteLoop,
+    /// Recurse without a base case (must be stopped by a limit or the deadline).
+    InfiniteRecursion,
     /// Return a value far larger than the output cap.
     HugeOutput,
     /// Set a global variable, then return anything. Runs before [`Self::ReadGlobal`].
@@ -56,7 +61,9 @@ impl ConformanceProgram {
             ReturnFortyTwo,
             EchoTool,
             Throw,
+            NoHostGlobals,
             InfiniteLoop,
+            InfiniteRecursion,
             HugeOutput,
             SetGlobal,
             ReadGlobal,
@@ -90,7 +97,14 @@ pub fn javascript_programs() -> impl Fn(ConformanceProgram) -> String {
                  export default await demo.echo({ n: 7 });"
             }
             Throw => "throw new Error('boom'); export default 1;",
+            NoHostGlobals => {
+                "export default typeof fetch === 'undefined' \
+                 && typeof process === 'undefined' \
+                 && typeof require === 'undefined' \
+                 && typeof Deno === 'undefined';"
+            }
             InfiniteLoop => "while (true) {} export default 1;",
+            InfiniteRecursion => "function f() { return f(); } f(); export default 1;",
             // Comfortably over the 1 MiB default output cap.
             HugeOutput => "export default 'x'.repeat(2000000);",
             SetGlobal => "globalThis.__codemodeProbe = 123; export default 1;",
@@ -141,9 +155,13 @@ async fn run_one<R: CodeRuntime>(
             expect_result(&out, &json!({ "n": 7 }), &name)
         }
         Throw => expect_error(&out, &name, "a thrown exception", |e| {
-            matches!(e, ExecError::Js { .. })
+            matches!(e, ExecError::Exception { .. })
         }),
-        InfiniteLoop => expect_error(&out, &name, "Timeout or Limit", |e| {
+        NoHostGlobals => {
+            expect_ok(&out, &name)?;
+            expect_result(&out, &json!(true), &name)
+        }
+        InfiniteLoop | InfiniteRecursion => expect_error(&out, &name, "Timeout or Limit", |e| {
             matches!(e, ExecError::Timeout | ExecError::Limit { .. })
         }),
         HugeOutput => expect_error(&out, &name, "OutputTooLarge", |e| {

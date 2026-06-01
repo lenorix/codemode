@@ -1,5 +1,5 @@
 //! The reference Boa backend passes the conformance suite (the cross-backend
-//! contract, defined in `tests/common/`). It's deterministic — no LLM — so it
+//! contract, defined in `tests/common/`). It's deterministic, no LLM, so it
 //! runs by default with `cargo test`.
 //!
 //! A new backend proves itself the same way: implement `CodeRuntime`, supply the
@@ -10,5 +10,5 @@ mod common;
 
 #[test]
 fn boa_passes_the_conformance_suite() {
-    common::assert_js_conformant(codemode_mcp::Boa::new());
+    common::assert_js_conformant(codemode::Boa::new());
 }

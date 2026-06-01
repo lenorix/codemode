@@ -17,9 +17,10 @@ use boa_engine::context::time::JsInstant;
 use boa_engine::job::{GenericJob, Job, JobExecutor, NativeAsyncJob, PromiseJob, TimeoutJob};
 use boa_engine::module::{ModuleLoader, Referrer};
 use boa_engine::prelude::{Finalize, JsData, Trace};
+use boa_engine::property::PropertyKey;
 use boa_engine::{
-    Context, JsArgs, JsError, JsNativeError, JsResult, JsString, JsValue, Module, NativeFunction,
-    Source, js_string,
+    Context, JsArgs, JsError, JsNativeError, JsObject, JsResult, JsString, JsValue, Module,
+    NativeFunction, Source, js_string,
 };
 
 use crate::runtime::{Bridge, CodeRuntime, RunRequest};
@@ -46,8 +47,36 @@ pub struct Boa;
 
 impl Boa {
     pub fn new() -> Self {
+        silence_expected_limit_panic();
         Self
     }
+}
+
+/// Boa raises a Rust *panic* (not a catchable JS error) when a runtime limit
+/// (loop, recursion, or stack) trips during module evaluation, because it can't
+/// turn that error into a promise-rejection reason. `run_inner` catches that
+/// panic and returns a clean [`ExecError::Limit`], so it's fully handled and
+/// routine for a sandbox running untrusted code. The default panic hook would
+/// still print Boa's confusing internal message to stderr on every limit hit, so
+/// we install a process-global hook (once) that drops exactly that message and
+/// forwards every other panic to the previous hook unchanged.
+fn silence_expected_limit_panic() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info.payload();
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or_default();
+            if message.contains("RuntimeLimit native error") {
+                return; // expected; handled by run_inner's catch_unwind
+            }
+            previous(info);
+        }));
+    });
 }
 
 impl CodeRuntime for Boa {
@@ -64,7 +93,7 @@ impl CodeRuntime for Boa {
         Box::pin(async move {
             // A fresh Context is built (and dropped) inside `run_inner`, so all of
             // this execution's JS heap and per-run state is released when it
-            // returns — nothing accumulates or leaks across runs.
+            // returns; nothing accumulates or leaks across runs.
             let (result, logs) = run_inner(
                 &request.source,
                 &request.servers,
@@ -90,7 +119,7 @@ Reach tools only by importing per-server modules, exactly \
 `import * as fs from './servers/filesystem'` (the `./servers/` prefix is required), \
 then calling the exported functions. Use the exact tool names from `find`; each \
 takes a single object argument (e.g. `await fs.readFile({ path })`) and returns a \
-Promise. You have no network, no filesystem, and no `fetch` of your own — the \
+Promise. You have no network, no filesystem, and no `fetch` of your own; the \
 imported server modules are the only way out.
 
 Modern JavaScript works (optional chaining, spread, destructuring, template \
@@ -142,7 +171,7 @@ async fn run_inner(
         // *module* evaluation, because it can't turn that error into a promise
         // rejection reason. We catch that panic and return a clean Limit error;
         // the context is fresh per run and dropped right after, so a poisoned
-        // engine state can't leak. (The robust fix is subprocess isolation; see docs.)
+        // engine state can't leak. (The real fix is subprocess isolation; see docs.)
         let eval = AssertUnwindSafe(async {
             let promise = module.load_link_evaluate(&mut context);
             queue
@@ -178,13 +207,25 @@ async fn run_inner(
                 // Surface a fix-naming error instead of a silent `null` the model
                 // can't act on.
                 if default.is_undefined() {
-                    return Err(ExecError::Js {
+                    return Err(ExecError::Exception {
                         message: "no value was exported: assign your answer with \
                                   `export default <value>` at the top level (not `return`, \
                                   `console.log`, or `module.exports`)"
                             .to_string(),
                     });
                 }
+                // `to_json` recurses one native frame per nesting level (so a deep
+                // result would overflow the island stack and *abort* the process),
+                // and it eagerly `Vec::with_capacity(arr.length)`s arrays (so a
+                // sparse array with a huge `.length` would try to allocate tens of
+                // GB and abort), both before the size cap can see the result. Vet
+                // the value iteratively first and reject if it's pathological.
+                result_convertible(
+                    &default,
+                    &mut context,
+                    MAX_RESULT_DEPTH,
+                    limits.max_output_bytes,
+                )?;
                 let value = default
                     .to_json(&mut context)
                     .map_err(js)?
@@ -201,7 +242,7 @@ async fn run_inner(
                     .unwrap_or_else(|_| "uncaught exception".to_string());
                 Err(classify(message))
             }
-            PromiseState::Pending => Err(ExecError::Js {
+            PromiseState::Pending => Err(ExecError::Exception {
                 message: "module did not finish executing".to_string(),
             }),
         }
@@ -216,7 +257,7 @@ async fn run_inner(
 }
 
 fn js(err: impl ToString) -> ExecError {
-    ExecError::Js {
+    ExecError::Exception {
         message: err.to_string(),
     }
 }
@@ -227,6 +268,119 @@ fn check_output_size(value: &serde_json::Value, max_bytes: usize) -> Result<(), 
         Ok(())
     } else {
         Err(ExecError::OutputTooLarge)
+    }
+}
+
+/// Max nesting depth of an exported value, before `to_json` (which recurses one
+/// native frame per level) can overflow the stack. Shared with the inbound
+/// tool-result guard (see [`crate::types::MAX_JSON_DEPTH`]).
+const MAX_RESULT_DEPTH: usize = crate::types::MAX_JSON_DEPTH;
+
+/// Vet that `value` is safe to hand to `to_json`, without native recursion (so
+/// the check itself can't overflow). Rejects two things `to_json` would turn
+/// into a process abort before the size cap could see them: nesting deeper than
+/// `max_depth`, and arrays whose `length` exceeds `max_array_len` (`to_json`
+/// eagerly `Vec::with_capacity`s that length, so a sparse `a.length = 4e9` would
+/// try to allocate tens of GB). An array longer than `max_array_len` can't fit
+/// the output cap anyway (each element serializes to at least one byte), so a
+/// `max_array_len` of `max_output_bytes` never rejects a result the size cap
+/// would have accepted.
+///
+/// It runs NO user JavaScript. `to_json` reads stored data-property values
+/// straight from the object's property map (substituting `null` for accessors)
+/// and never invokes getters or Proxy traps, so we mirror that exactly: values
+/// are read from the property descriptor, and Proxy objects (whose `ownKeys`
+/// trap is user code) are not enumerated. This matters for more than fidelity.
+/// This walk runs *after* the wall-clock deadline that wraps evaluation, so a
+/// getter or trap firing here would execute unbounded code past the timeout.
+///
+/// It's a depth-first walk whose explicit stack holds only the *current path*
+/// (one frame per level), so the stack height equals the current depth and a
+/// wide level can never inflate it. Every node is visited and there's no
+/// early-accept, so a deep branch hidden behind wide padding can't slip past.
+///
+/// Best-effort, not a hard guarantee: a structure deep enough can still overflow
+/// Boa's GC when the context drops, and other hostile compute (ReDoS, giant
+/// allocations) isn't covered. It cleanly handles the realistic cases; the real
+/// containment for deliberately hostile code is the subprocess runtime (see
+/// docs/security.md).
+fn result_convertible(
+    value: &JsValue,
+    context: &mut Context,
+    max_depth: usize,
+    max_array_len: usize,
+) -> Result<(), ExecError> {
+    use boa_engine::builtins::proxy::Proxy;
+
+    // The stored data value for `key`, or None for an accessor or missing
+    // property (exactly what `to_json` recurses into). Reads the property map
+    // directly, so it never fires a getter.
+    let stored = |object: &JsObject, key: &PropertyKey| -> Option<JsValue> {
+        object
+            .borrow()
+            .properties()
+            .get(key)
+            .and_then(|d| d.value().cloned())
+    };
+    // `to_json` eagerly `Vec::with_capacity`s an array's `length`, so a sparse
+    // `a.length = 4e9` aborts. An array's `length` is always a data property
+    // (the spec forbids an accessor there), so reading it fires no getter.
+    let too_long = |object: &JsObject| -> bool {
+        object.is_array()
+            && stored(object, &js_string!("length").into())
+                .and_then(|len| len.as_number())
+                .is_some_and(|len| len > max_array_len as f64)
+    };
+    let too_wide = || ExecError::Limit {
+        what: format!("exported array is longer than {max_array_len} elements"),
+    };
+    // Own keys to descend into. A Proxy's `ownKeys` trap is user code, and
+    // `to_json` reads a Proxy's own storage as empty anyway, so we skip it.
+    let keys = |object: &JsObject, context: &mut Context| -> Vec<PropertyKey> {
+        if object.is::<Proxy>() {
+            Vec::new()
+        } else {
+            object.own_property_keys(context).unwrap_or_default()
+        }
+    };
+
+    let Some(root) = value.as_object() else {
+        return Ok(());
+    };
+    if too_long(&root) {
+        return Err(too_wide());
+    }
+    let root_keys = keys(&root, context);
+    // Frame = (object, its keys, index of the next key to visit).
+    let mut stack: Vec<(JsObject, Vec<PropertyKey>, usize)> = vec![(root, root_keys, 0)];
+    loop {
+        let Some(top) = stack.last() else {
+            return Ok(());
+        };
+        if top.2 >= top.1.len() {
+            stack.pop();
+            continue;
+        }
+        // The child about to be inspected sits at depth `stack.len()`.
+        if stack.len() > max_depth {
+            return Err(ExecError::Limit {
+                what: format!("exported value nests deeper than {max_depth} levels"),
+            });
+        }
+        let object = top.0.clone();
+        let key = top.1[top.2].clone();
+        let last = stack.len() - 1;
+        stack[last].2 += 1;
+        if let Some(child) = stored(&object, &key)
+            && let Some(child) = child.as_object()
+        {
+            let child = child.clone();
+            if too_long(&child) {
+                return Err(too_wide());
+            }
+            let child_keys = keys(&child, context);
+            stack.push((child, child_keys, 0));
+        }
     }
 }
 
@@ -241,7 +395,7 @@ fn classify(message: String) -> ExecError {
     if is_limit {
         ExecError::Limit { what: message }
     } else {
-        ExecError::Js { message }
+        ExecError::Exception { message }
     }
 }
 
@@ -288,7 +442,10 @@ fn log(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsV
         if line.len() > remaining {
             true
         } else {
-            state.log_budget.set(remaining - line.len());
+            // Charge at least one byte per line so empty/tiny lines still draw
+            // down the budget; otherwise `console.log('')` in a loop grows the
+            // `logs` Vec without bound. `max(1) <= remaining` here (remaining > 0).
+            state.log_budget.set(remaining - line.len().max(1));
             state.logs.borrow_mut().push(line);
             false
         }
@@ -405,8 +562,8 @@ fn module_source(server: &ServerTools) -> String {
             out.push_str(&format!("/** {} */\n", desc.replace("*/", "* /")));
         }
         // Define under an internal identifier, then export under the exact tool
-        // name via a string-named export. This works for any name — a normal name
-        // like `echo` is still reached as `ns.echo`, an odd one as `ns["a-b"]` —
+        // name via a string-named export. This works for any name: a normal name
+        // like `echo` is still reached as `ns.echo`, an odd one as `ns["a-b"]`,
         // and sidesteps JS-identifier and reserved-word edge cases entirely.
         out.push_str(&format!(
             "function __t{i}(args) {{ return __c({server_lit}, {tool_lit}, JSON.stringify(args === undefined ? {{}} : args)); }}\n"
@@ -448,7 +605,12 @@ impl Queue {
 
     fn drain_jobs(&self, context: &mut Context) {
         self.drain_timeout_jobs(context);
-        if let Some(generic) = self.generic_jobs.borrow_mut().pop_front()
+        // Pull the job out and drop the borrow before calling it: in edition 2024
+        // a let-chain scrutinee's temporary lives to the end of the `if`, so
+        // borrowing inline would hold the `RefMut` across `call`, which can
+        // re-enqueue and re-borrow `generic_jobs`.
+        let generic = self.generic_jobs.borrow_mut().pop_front();
+        if let Some(generic) = generic
             && let Err(err) = generic.call(context)
         {
             eprintln!("Uncaught {err}");
@@ -521,8 +683,8 @@ impl JobExecutor for Queue {
                 continue;
             }
             // Only async jobs and/or a future timer remain. Sleep until the
-            // nearest timer is due, or until an async job completes — whichever
-            // is first — instead of busy-polling, so a pending `setTimeout` can't
+            // nearest timer is due, or until an async job completes, whichever
+            // is first, instead of busy-polling, so a pending `setTimeout` can't
             // peg the island's CPU (and starve other executions sharing it).
             let sleep_ms = next_timeout_ms.map(|due| {
                 let now = context.borrow().clock().now().millis_since_epoch();
@@ -665,7 +827,7 @@ mod tests {
             demo_servers(),
             bridge,
         );
-        let Some(ExecError::Js { message }) = outcome.error else {
+        let Some(ExecError::Exception { message }) = outcome.error else {
             panic!("expected a Js error, got {:?}", outcome.error);
         };
         // The message should guide the model back on track: name the available
@@ -686,7 +848,7 @@ mod tests {
             vec![],
             echo_bridge(),
         );
-        let Some(ExecError::Js { message }) = outcome.error else {
+        let Some(ExecError::Exception { message }) = outcome.error else {
             panic!("expected a Js error, got {:?}", outcome.error);
         };
         assert!(
@@ -727,7 +889,7 @@ mod tests {
     #[test]
     fn frees_memory_between_runs() {
         // A run that allocates a large array completes, and the next run is
-        // unaffected — the per-run context (and its heap) was dropped.
+        // unaffected: the per-run context (and its heap) was dropped.
         let big = run(
             "const a = new Array(500000).fill(7); export default a.length;",
             vec![],
@@ -822,6 +984,126 @@ mod tests {
     }
 
     #[test]
+    fn empty_log_lines_are_budgeted() {
+        // Empty lines must still draw down the budget, or `console.log('')` in a
+        // loop grows the logs Vec without bound (would be a memory DoS).
+        let limits = Limits {
+            max_output_bytes: 10,
+            ..Limits::default()
+        };
+        let outcome = run_with(
+            "for (let i = 0; i < 1000; i++) console.log(''); export default 'done';",
+            vec![],
+            echo_bridge(),
+            limits,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert!(
+            outcome.logs.len() <= 11,
+            "empty logs not bounded: {} lines",
+            outcome.logs.len()
+        );
+    }
+
+    #[test]
+    fn rejects_pathologically_deep_results() {
+        // A deeply nested export would overflow the native stack during `to_json`
+        // and *abort* the process; the depth guard turns it into a clean Limit.
+        // (1000 is past the 256 cap but shallow enough that the structure's own
+        // drop is safe; extreme depth is only fully contained by the subprocess
+        // runtime, see docs/security.md.)
+        let outcome = run(
+            "let a = []; for (let i = 0; i < 1000; i++) a = [a]; export default a;",
+            vec![],
+            echo_bridge(),
+        );
+        assert!(
+            matches!(outcome.error, Some(ExecError::Limit { .. })),
+            "expected a Limit error, got {:?}",
+            outcome.error
+        );
+    }
+
+    #[test]
+    fn rejects_deep_results_hidden_behind_wide_padding() {
+        // Many shallow keys before a deep chain must NOT let the chain slip past
+        // the depth probe; a width-budgeted probe would early-accept here and
+        // then abort the process inside to_json.
+        let outcome = run(
+            "const root = {};\n\
+             for (let i = 0; i < 120000; i++) root['p' + i] = 1;\n\
+             let chain = []; for (let i = 0; i < 1000; i++) chain = [chain];\n\
+             root.z_deep = chain;\n\
+             export default root;",
+            vec![],
+            echo_bridge(),
+        );
+        assert!(
+            matches!(outcome.error, Some(ExecError::Limit { .. })),
+            "expected a Limit error, got {:?}",
+            outcome.error
+        );
+    }
+
+    #[test]
+    fn rejects_huge_sparse_array_results() {
+        // A sparse array with a giant `.length` would make `to_json` eagerly
+        // `Vec::with_capacity` that length (tens of GB) and abort the process; it
+        // must come back as a clean Limit instead.
+        let outcome = run(
+            "const a = []; a.length = 4294967295; export default a;",
+            vec![],
+            echo_bridge(),
+        );
+        assert!(
+            matches!(outcome.error, Some(ExecError::Limit { .. })),
+            "expected a Limit error, got {:?}",
+            outcome.error
+        );
+    }
+
+    #[test]
+    fn allows_normally_nested_results() {
+        // Ordinary nesting (well under the cap) round-trips fine.
+        let outcome = run(
+            "export default { a: { b: { c: [1, 2, { d: 3 }] } } };",
+            vec![],
+            echo_bridge(),
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(
+            outcome.result,
+            json!({ "a": { "b": { "c": [1, 2, { "d": 3 }] } } })
+        );
+    }
+
+    #[test]
+    fn getters_are_not_invoked_during_result_conversion() {
+        // The result guard runs after the wall-clock deadline. If it read values
+        // with `get` it would fire getters: arbitrary code past the timeout, a
+        // DoS. It must read stored values only, matching `to_json` (which renders
+        // an accessor as null and never calls it). Here a getter, if invoked,
+        // would replace `payload` with a 400-deep object (past the 256 cap) and
+        // trip a Limit. `trigger` is defined first so it would be visited before
+        // `payload`. The run must instead succeed with the accessor as null.
+        let outcome = run(
+            "function deep(n) { let o = {}; for (let i = 0; i < n; i++) o = { next: o }; return o; }\n\
+             const o = {};\n\
+             Object.defineProperty(o, 'trigger', { enumerable: true, get() { o.payload = deep(400); return 0; } });\n\
+             o.payload = 1;\n\
+             export default o;",
+            vec![],
+            echo_bridge(),
+        );
+        assert!(
+            outcome.error.is_none(),
+            "getter must not run during conversion, got {:?}",
+            outcome.error
+        );
+        assert_eq!(outcome.result, json!({ "trigger": null, "payload": 1 }));
+    }
+
+    #[test]
     fn bridge_error_surfaces() {
         let bridge: Bridge =
             Rc::new(|_s, _t, _a| Box::pin(async move { Err(BridgeError::Call("boom".into())) }));
@@ -831,6 +1113,6 @@ mod tests {
             demo_servers(),
             bridge,
         );
-        assert!(matches!(outcome.error, Some(ExecError::Js { .. })));
+        assert!(matches!(outcome.error, Some(ExecError::Exception { .. })));
     }
 }

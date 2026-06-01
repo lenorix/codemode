@@ -1,5 +1,5 @@
 [package]
-name = "codemode-mcp"
+name = "codemode"
 version = "0.1.0"
 edition = "2024"
 
@@ -25,21 +25,26 @@ futures-concurrency = "7"
 futures-lite = "2"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rmcp = { version = "1.7", default-features = false, features = ["client", "transport-child-process", "local"] }
-toml = "0.8"
+toml = "1"
 clap = { version = "4", features = ["derive"], optional = true }
 rig-core = { version = "0.37", optional = true, default-features = false }
 
 # rlimit gives a safe wrapper over setrlimit so the subprocess worker can cap its
 # own address space and CPU without any `unsafe` in our code.
 [target.'cfg(unix)'.dependencies]
-rlimit = { version = "0.10", optional = true }
+rlimit = { version = "0.11", optional = true }
 
 [features]
 default = ["cli"]
 # The `codemode-mcp` binary: the MCP server + CLI.
 cli = ["dep:clap", "rmcp/server", "rmcp/transport-io"]
-# The adapter for embedding codemode in a Rig agent.
+# The adapter for embedding codemode in a Rig agent. Just the adapter: it's
+# generic over the completion model, so it needs none of rig-core's provider or
+# HTTP-client machinery (the consumer brings their own provider).
 rig = ["dep:rig-core"]
+# Adds rig-core's openai provider + HTTP backend, only so the `rig_agent` example
+# can talk to a local server. Library users keep `rig` and bring their own client.
+rig-example = ["rig", "rig-core/reqwest", "rig-core/rustls"]
 # Run the model's code in a child process with OS resource limits (Unix).
 subprocess = ["dep:rlimit", "cli"]
 
@@ -48,7 +53,11 @@ name = "codemode-mcp"
 path = "src/main.rs"
 required-features = ["cli"]
 
+[[example]]
+name = "rig_agent"
+required-features = ["rig-example"]
+
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 # For the serve end-to-end test: an MCP client connecting to our `serve` binary.
 rmcp = { version = "1.7", default-features = false, features = ["client", "transport-child-process", "local"] }

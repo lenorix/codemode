@@ -1,12 +1,12 @@
-//! Surface B: use codemode-mcp as a dependency inside a [Rig](https://docs.rig.rs)
-//! agent — the `codemode()`-for-Rust shape. Instead of handing the agent every
+//! Surface B: use codemode as a dependency inside a [Rig](https://docs.rig.rs)
+//! agent, the `codemode()`-for-Rust shape. Instead of handing the agent every
 //! MCP tool, `.code_mode(&cm)` gives it three tools (discover / find / execute)
 //! and a preamble telling the model to write code.
 //!
 //! ```ignore
 //! use std::sync::Arc;
-//! use codemode_mcp::{CodeMode, ServerConfig};
-//! use codemode_mcp::rig::CodeModeExt;
+//! use codemode::{CodeMode, ServerConfig};
+//! use codemode::rig::CodeModeExt;
 //! use rig::providers::anthropic;
 //!
 //! let cm = Arc::new(

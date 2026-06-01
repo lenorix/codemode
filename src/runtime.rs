@@ -68,7 +68,33 @@ impl RunRequest {
 }
 
 /// A backend that runs model-written code. This is the one extension point:
-/// community backends (other engines or languages) implement it.
+/// community backends (other engines or languages) implement it. It is the
+/// "executor seam", the analog of Cloudflare Code Mode's `Executor` interface
+/// (`execute(code, fns) -> {result, error, logs}`): the brain hands it the
+/// source and a bridge to the tools, and gets an [`Outcome`] back.
+///
+/// A minimal backend (ignores the servers, just returns a constant):
+///
+/// ```ignore
+/// use codemode::{CodeRuntime, RunRequest, Capabilities, Outcome, LocalFuture};
+/// use serde_json::json;
+///
+/// struct NullRuntime;
+/// impl CodeRuntime for NullRuntime {
+///     fn capabilities(&self) -> Capabilities {
+///         Capabilities::new("none", "This backend ignores your code.")
+///     }
+///     fn run(&self, _request: RunRequest) -> LocalFuture<Outcome> {
+///         Box::pin(async { Outcome::ok(json!(null), Vec::new()) })
+///     }
+/// }
+/// ```
+///
+/// A real backend, in `run`: stand up a fresh context, generate one module per
+/// `request.servers` entry (each tool calls `request.bridge(server, tool, args_json)`),
+/// run `request.source`, honour `request.limits`, and convert the result to JSON.
+/// See `src/boa.rs` (in-process) and `SubprocessRuntime` (out-of-process) for the
+/// two reference implementations, and `tests/common/` for the conformance suite.
 ///
 /// Contract:
 /// - `run` must execute `request.source` in a **fresh, isolated context** each
@@ -86,7 +112,7 @@ impl RunRequest {
 /// V8 isolate pool, an out-of-process engine) must still conform to this `!Send`
 /// shape; `SubprocessRuntime` shows it crossing a process boundary.
 ///
-/// Stability: the trait is **0.x and unstable** — it may change until a second
+/// Stability: the trait is **0.x and unstable**. It may change until a second
 /// independent backend validates it. The frozen invariant is the [`Bridge`]:
 /// pure data in, pure data out.
 pub trait CodeRuntime {

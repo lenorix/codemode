@@ -2,7 +2,7 @@
 //! Ignored by default: needs `npx` and network. Run with:
 //!   cargo test --test integration_everything -- --ignored
 
-use codemode_mcp::{CodeMode, ServerConfig};
+use codemode::{CodeMode, ServerConfig};
 
 #[tokio::test]
 #[ignore = "requires npx + network"]

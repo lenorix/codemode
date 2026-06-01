@@ -4,7 +4,7 @@
 
 #![cfg(all(feature = "subprocess", unix))]
 
-use codemode_mcp::{CodeMode, LocalTools, SubprocessRuntime};
+use codemode::{CodeMode, LocalTools, SubprocessRuntime};
 use serde_json::json;
 
 fn worker() -> SubprocessRuntime {

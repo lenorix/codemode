@@ -1,8 +1,8 @@
 //! The library's error type.
 
 /// Errors a `CodeMode` operation can return. These are harness failures
-/// (config, spawning, transport). Errors *inside* the executed code — a thrown
-/// exception, a timeout, a denied tool — are carried in [`crate::Outcome`]
+/// (config, spawning, transport). Errors *inside* the executed code, a thrown
+/// exception, a timeout, a denied tool, are carried in [`crate::Outcome`]
 /// instead, so the model can see them.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

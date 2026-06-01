@@ -1,7 +1,7 @@
 //! Optional subprocess isolation (Unix): run the model's code in a child process
 //! under OS resource limits (`RLIMIT_AS` for memory, `RLIMIT_CPU`) plus a
-//! wall-clock kill, so a runaway script can't take down the host — the hard
-//! CPU/memory bound that an in-process engine can't give.
+//! wall-clock kill, so a runaway script can't take down the host. This is the
+//! hard CPU/memory bound that an in-process engine can't give.
 //!
 //! `SubprocessRuntime` is just another [`CodeRuntime`]: instead of running Boa
 //! in-process, it spawns a worker (`codemode-mcp __worker`) that runs Boa. The
@@ -146,7 +146,7 @@ impl SubprocessRuntime {
 
 impl CodeRuntime for SubprocessRuntime {
     fn capabilities(&self) -> Capabilities {
-        // Same JS engine, just isolated — identical guidance. RLIMIT_AS is a real
+        // Same JS engine, just isolated, so identical guidance. RLIMIT_AS is a real
         // hard memory cap on Linux; macOS doesn't honour it (only the wall-clock
         // kill bounds a runaway there), so only claim the cap where it's true.
         let mut caps = Boa::new().capabilities();
@@ -253,7 +253,7 @@ async fn pump(
 }
 
 fn failed(message: String) -> Outcome {
-    Outcome::failed(ExecError::Js { message }, Vec::new())
+    Outcome::failed(ExecError::Exception { message }, Vec::new())
 }
 
 async fn write_line<W: AsyncWriteExt + Unpin>(writer: &mut W, line: &str) -> std::io::Result<()> {
@@ -263,22 +263,30 @@ async fn write_line<W: AsyncWriteExt + Unpin>(writer: &mut W, line: &str) -> std
 }
 
 /// Read one `\n`-delimited line, failing if it exceeds `max` bytes so a peer
-/// can't force unbounded allocation. Returns `Ok(None)` at EOF with no data.
+/// can't force unbounded allocation. Every protocol message ends in `\n`, so EOF
+/// before a newline means a truncated/absent message (e.g. the worker was killed
+/// mid-write); that returns `Ok(None)`, which callers report as "the worker
+/// exited" rather than as a confusing parse error on partial bytes.
 async fn read_line_capped<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     max: usize,
 ) -> io::Result<Option<String>> {
+    let too_long = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "protocol line exceeds maximum length",
+        )
+    };
     let mut buf: Vec<u8> = Vec::new();
     loop {
         let chunk = reader.fill_buf().await?;
         if chunk.is_empty() {
-            return if buf.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
-            };
+            return Ok(None); // EOF: no complete (newline-terminated) line
         }
         if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            if buf.len() + pos > max {
+                return Err(too_long());
+            }
             buf.extend_from_slice(&chunk[..pos]);
             reader.consume(pos + 1);
             return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
@@ -287,10 +295,7 @@ async fn read_line_capped<R: AsyncBufRead + Unpin>(
         buf.extend_from_slice(chunk);
         reader.consume(consumed);
         if buf.len() > max {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "protocol line exceeds maximum length",
-            ));
+            return Err(too_long());
         }
     }
 }
@@ -335,7 +340,7 @@ pub async fn run_worker() {
     #[cfg(unix)]
     apply_resource_limits(
         job.max_memory_bytes,
-        (job.limits.timeout_ms / 1000).max(1) + 2,
+        (job.limits.timeout_ms / 1000).max(1).saturating_add(2),
     );
 
     let io = Rc::new(Mutex::new(WorkerIo {
@@ -345,12 +350,12 @@ pub async fn run_worker() {
     let bridge = remote_bridge(io.clone());
 
     let outcome = Boa::new()
-        .run(RunRequest {
-            source: job.source,
-            servers: job.servers,
+        .run(RunRequest::new(
+            job.source,
+            job.servers,
             bridge,
-            limits: job.limits.into(),
-        })
+            job.limits.into(),
+        ))
         .await;
 
     let mut io = io.lock().await;
