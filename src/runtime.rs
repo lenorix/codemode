@@ -93,8 +93,8 @@ impl RunRequest {
 /// A real backend, in `run`: stand up a fresh context, generate one module per
 /// `request.servers` entry (each tool calls `request.bridge(server, tool, args_json)`),
 /// run `request.source`, honour `request.limits`, and convert the result to JSON.
-/// See `src/boa.rs` (in-process) and `SubprocessRuntime` (out-of-process) for the
-/// two reference implementations, and `tests/common/` for the conformance suite.
+/// See `src/boa.rs` (the in-process Boa backend) for the reference
+/// implementation, and `tests/common/` for the conformance suite.
 ///
 /// Contract:
 /// - `run` must execute `request.source` in a **fresh, isolated context** each
@@ -109,8 +109,8 @@ impl RunRequest {
 /// Execution is island-local by contract: [`Bridge`] is `Rc<dyn Fn>` and `run`
 /// returns a [`LocalFuture`] (both `!Send`), because the engine runs on a single
 /// dedicated thread (Boa's `Context` is `!Send`). A naturally-`Send` backend (a
-/// V8 isolate pool, an out-of-process engine) must still conform to this `!Send`
-/// shape; `SubprocessRuntime` shows it crossing a process boundary.
+/// V8 isolate pool, or an out-of-process engine) must still conform to this
+/// `!Send` shape, marshalling across its boundary behind the trait.
 ///
 /// Stability: the trait is **0.x and unstable**. It may change until a second
 /// independent backend validates it. The frozen invariant is the [`Bridge`]:

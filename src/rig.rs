@@ -35,9 +35,9 @@ use serde::Deserialize;
 use crate::{CodeMode, Error, Outcome, ServerInfo, ToolInfo};
 
 /// Extension on Rig's `AgentBuilder` that registers the three code-execution
-/// tools. The usage guidance rides on the `execute` tool's own description (see
-/// [`ExecuteTool`]), so it isn't also appended to the preamble: duplicating it in
-/// both places would re-send the same guidance twice in every prompt.
+/// tools. The usage guidance rides on the `execute` tool's own description, so it
+/// isn't also appended to the preamble: duplicating it in both places would
+/// re-send the same guidance twice in every prompt.
 pub trait CodeModeExt<M, P>
 where
     M: CompletionModel,

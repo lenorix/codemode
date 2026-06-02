@@ -39,9 +39,6 @@ mod types;
 #[cfg(feature = "rig")]
 pub mod rig;
 
-#[cfg(feature = "subprocess")]
-pub mod subprocess;
-
 pub use boa::Boa;
 pub use codemode::{CodeMode, CodeModeBuilder};
 pub use config::{Config, ServerConfig};
@@ -49,6 +46,4 @@ pub use error::{Error, Result};
 pub use local::LocalTools;
 pub use runtime::{Bridge, BridgeError, CodeRuntime, RunRequest};
 pub use source::LocalFuture;
-#[cfg(feature = "subprocess")]
-pub use subprocess::SubprocessRuntime;
 pub use types::{Capabilities, ExecError, Limits, Outcome, ServerInfo, ServerTools, ToolInfo};

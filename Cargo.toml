@@ -29,11 +29,6 @@ toml = "1"
 clap = { version = "4", features = ["derive"], optional = true }
 rig-core = { version = "0.37", optional = true, default-features = false }
 
-# rlimit gives a safe wrapper over setrlimit so the subprocess worker can cap its
-# own address space and CPU without any `unsafe` in our code.
-[target.'cfg(unix)'.dependencies]
-rlimit = { version = "0.11", optional = true }
-
 [features]
 default = ["cli"]
 # The `codemode-mcp` binary: the MCP server + CLI.
@@ -45,8 +40,6 @@ rig = ["dep:rig-core"]
 # Adds rig-core's openai provider + HTTP backend, only so the `rig_agent` example
 # can talk to a local server. Library users keep `rig` and bring their own client.
 rig-example = ["rig", "rig-core/reqwest", "rig-core/rustls"]
-# Run the model's code in a child process with OS resource limits (Unix).
-subprocess = ["dep:rlimit", "cli"]
 
 [[bin]]
 name = "codemode-mcp"

@@ -81,6 +81,16 @@ impl CodeMode {
         let max_concurrent = max_concurrent.max(1);
         let island = std::thread::Builder::new()
             .name("codemode-island".to_string())
+            // Source is parsed and evaluated on this single island thread, and
+            // boa_parser is recursive descent with no depth guard (~20 KiB of
+            // stack per nesting level). This stack is paired with the source-size
+            // cap (see boa.rs `MAX_SOURCE_BYTES`): cap x 20 KiB stays safely under
+            // it, so even an all-brackets source can't overflow the parser. The
+            // stack is virtual address space, committed only as deep code actually
+            // uses it, and the parse is synchronous so only one runs at a time (no
+            // concurrency multiplier). An explicit stack_size also isn't subject to
+            // the main thread's RLIMIT_STACK.
+            .stack_size(256 * 1024 * 1024)
             .spawn(move || {
                 let local = tokio::task::LocalSet::new();
                 local.block_on(
@@ -349,7 +359,13 @@ async fn island_loop(
 }
 
 async fn discover(source: &Rc<dyn ToolSource>, allow: &AllowList) -> Result<Vec<ServerInfo>> {
-    let servers = source.clone().servers().await?;
+    let servers = source.clone().servers().await.map_err(|e| {
+        // Genericize like the bridge does: a source error can carry paths or
+        // launch detail, so log it for the operator and give the model a clean
+        // message rather than the raw error.
+        eprintln!("codemode: discover failed: {e}");
+        Error::Mcp("could not list servers".to_string())
+    })?;
     Ok(servers
         .into_iter()
         .filter(|s| allow.server_allowed(&s.name))
@@ -364,15 +380,41 @@ async fn find(
     if !allow.server_allowed(server) {
         return Err(Error::UnknownServer(server.to_string()));
     }
-    let tools = source.clone().tools(server.to_string()).await?;
-    Ok(tools
+    // Same genericization as the bridge: keep `UnknownServer` (it's safe and
+    // useful to the model), but a spawn/listing failure can carry a path or a
+    // short unredacted secret, so log the detail and return a clean message.
+    let tools = source
+        .clone()
+        .tools(server.to_string())
+        .await
+        .map_err(|e| match e {
+            Error::UnknownServer(s) => Error::UnknownServer(s),
+            other => {
+                eprintln!("codemode: find('{server}') failed: {other}");
+                Error::Mcp(format!("could not list tools for server '{server}'"))
+            }
+        })?;
+    let tools = tools
         .into_iter()
         .filter(|t| allow.allows(server, &t.name))
         .map(|mut t| {
             t.input_schema = slim_schema(&t.input_schema);
             t
         })
-        .collect())
+        .collect();
+    Ok(dedup_tools(tools))
+}
+
+/// Keep only the first tool of each name. A downstream server can advertise two
+/// tools with the same name; the generated module would then emit duplicate
+/// exports and fail to parse, taking down every tool on that server, so collapse
+/// by name here the way `LocalTools` already does.
+fn dedup_tools(tools: Vec<ToolInfo>) -> Vec<ToolInfo> {
+    let mut seen = std::collections::HashSet::new();
+    tools
+        .into_iter()
+        .filter(|t| seen.insert(t.name.clone()))
+        .collect()
 }
 
 /// Trim presentation and meta keys from a JSON Schema before `find` returns it,
@@ -514,10 +556,12 @@ async fn exposed_servers(
         // A server that fails to list its tools is skipped (not fatal): a broken
         // server shouldn't tear down executions that don't use it.
         let tools = match source.clone().tools(server.name.clone()).await {
-            Ok(tools) => tools
-                .into_iter()
-                .filter(|t| allow.allows(&server.name, &t.name))
-                .collect(),
+            Ok(tools) => dedup_tools(
+                tools
+                    .into_iter()
+                    .filter(|t| allow.allows(&server.name, &t.name))
+                    .collect(),
+            ),
             Err(e) => {
                 eprintln!("codemode: skipping server '{}': {e}", server.name);
                 continue;
@@ -696,6 +740,188 @@ mod tests {
             DEFAULT_MAX_CONCURRENT,
         )
         .unwrap()
+    }
+
+    // A source that lists a `demo` server but errors with a secret-bearing message
+    // on tools() (when `fail_list`) and always on call(), to verify internal
+    // detail is genericized before it can reach the model.
+    const LEAK_SECRET: &str = "/secret/path?token=abcd";
+
+    struct LeakySource {
+        fail_list: bool,
+    }
+
+    impl crate::source::ToolSource for LeakySource {
+        fn server_names(&self) -> Vec<String> {
+            vec!["demo".into()]
+        }
+        fn servers(self: Rc<Self>) -> crate::source::LocalFuture<Result<Vec<ServerInfo>>> {
+            Box::pin(async {
+                Ok(vec![ServerInfo {
+                    name: "demo".into(),
+                    description: None,
+                }])
+            })
+        }
+        fn tools(
+            self: Rc<Self>,
+            _server: String,
+        ) -> crate::source::LocalFuture<Result<Vec<ToolInfo>>> {
+            Box::pin(async move {
+                if self.fail_list {
+                    Err(Error::Mcp(LEAK_SECRET.into()))
+                } else {
+                    Ok(vec![ToolInfo {
+                        name: "boom".into(),
+                        description: None,
+                        input_schema: json!({}),
+                    }])
+                }
+            })
+        }
+        fn call(
+            self: Rc<Self>,
+            _server: String,
+            _tool: String,
+            _args: Value,
+        ) -> crate::source::LocalFuture<Result<Value>> {
+            Box::pin(async { Err(Error::Mcp(LEAK_SECRET.into())) })
+        }
+    }
+
+    fn leaky_code_mode(fail_list: bool) -> CodeMode {
+        let factory: SourceFactory =
+            Box::new(move || Rc::new(LeakySource { fail_list }) as Rc<dyn ToolSource>);
+        let mut allow = AllowList::default();
+        allow.allow_all("demo");
+        CodeMode::spawn(
+            factory,
+            Box::new(Boa::new()),
+            allow,
+            Limits::default(),
+            DEFAULT_MAX_CONCURRENT,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn find_genericizes_source_errors() {
+        // A listing failure can carry a path or short secret; the model must see a
+        // clean message, not the raw error (the operator gets the detail on stderr).
+        let cm = leaky_code_mode(true);
+        let msg = cm.find("demo").await.unwrap_err().to_string();
+        assert!(
+            !msg.contains("secret") && !msg.contains("token"),
+            "find leaked internal detail: {msg}"
+        );
+        assert!(
+            msg.contains("could not list tools"),
+            "unexpected message: {msg}"
+        );
+        cm.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bridge_genericizes_non_local_tool_errors() {
+        // The generic-scrub arm of the bridge: a non-local (MCP) tool error must
+        // reach the model as a generic message, never its secret-bearing detail.
+        let cm = leaky_code_mode(false);
+        let outcome = cm
+            .execute("import * as d from './servers/demo'; export default await d.boom({});")
+            .await
+            .unwrap();
+        let msg = format!(
+            "{:?}",
+            outcome.error.expect("expected the tool error to surface")
+        );
+        assert!(
+            !msg.contains("secret") && !msg.contains("token"),
+            "bridge leaked internal detail: {msg}"
+        );
+        assert!(
+            msg.contains("tool call failed"),
+            "unexpected message: {msg}"
+        );
+        cm.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_tool_names_do_not_break_the_server_module() {
+        use crate::source::fake::FakeSource;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let factory: SourceFactory = Box::new(|| {
+            let mut tools = HashMap::new();
+            tools.insert(
+                "demo".to_string(),
+                vec![
+                    ToolInfo {
+                        name: "dup".into(),
+                        description: None,
+                        input_schema: json!({}),
+                    },
+                    ToolInfo {
+                        name: "dup".into(),
+                        description: None,
+                        input_schema: json!({}),
+                    },
+                ],
+            );
+            Rc::new(FakeSource {
+                servers: vec![ServerInfo {
+                    name: "demo".into(),
+                    description: None,
+                }],
+                tools,
+                responder: Box::new(|_s, tool, _a| json!({ "tool": tool })),
+                tools_calls: Arc::new(AtomicUsize::new(0)),
+            }) as Rc<dyn ToolSource>
+        });
+        let mut allow = AllowList::default();
+        allow.allow_all("demo");
+        let cm = CodeMode::spawn(
+            factory,
+            Box::new(Boa::new()),
+            allow,
+            Limits::default(),
+            DEFAULT_MAX_CONCURRENT,
+        )
+        .unwrap();
+        // Without dedup the generated module would emit two `dup` exports and fail
+        // to parse, taking down the whole server; with it, the tool is callable.
+        let outcome = cm
+            .execute("import * as d from './servers/demo'; export default await d.dup({});")
+            .await
+            .unwrap();
+        assert!(
+            outcome.error.is_none(),
+            "duplicate tool names broke the module: {:?}",
+            outcome.error
+        );
+        assert_eq!(outcome.result, json!({ "tool": "dup" }));
+        cm.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deeply_nested_source_within_the_cap_parses_on_the_island() {
+        // boa_parser has no recursion limit, so deep source would overflow a small
+        // stack and abort the process during parse. This source (300 nested parens,
+        // well within MAX_SOURCE_BYTES) is far deeper than the old 2 MiB island
+        // could parse; the roomy island stack parses it cleanly. Parens evaluate to
+        // a shallow value, so the result-depth guard doesn't fire and we get the
+        // value back, proving the parse succeeded without crashing.
+        let cm = code_mode(AllowList::default());
+        let src = format!("export default {}1{};", "(".repeat(300), ")".repeat(300));
+        let outcome = cm.execute(&src).await.unwrap();
+        assert!(
+            outcome.error.is_none(),
+            "deep source within the cap should parse: {:?}",
+            outcome.error
+        );
+        assert_eq!(outcome.result.as_f64(), Some(1.0));
+        cm.shutdown().await.unwrap();
     }
 
     #[test]

@@ -1,7 +1,9 @@
 //! The `codemode-mcp` binary.
 //!
-//!   codemode-mcp serve [--config <file>]   run as a stdio MCP server (the main use)
-//!   codemode-mcp tools [--config]          list the configured servers and their tools
+//! ```text
+//! codemode-mcp serve [--config <file>]   run as a stdio MCP server (the main use)
+//! codemode-mcp tools [--config]          list the configured servers and their tools
+//! ```
 //!
 //! `serve` exposes exactly three tools (discover / find / execute) to a host, so
 //! the host's model writes code instead of calling every downstream tool. The
@@ -50,21 +52,6 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    // The hidden `__worker` subcommand is the child process of the subprocess
-    // isolation runtime (see src/subprocess.rs). It's not a user-facing command.
-    #[cfg(feature = "subprocess")]
-    if std::env::args().nth(1).as_deref() == Some("__worker") {
-        let rt = match build_runtime() {
-            Ok(rt) => rt,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::from(2);
-            }
-        };
-        tokio::task::LocalSet::new().block_on(&rt, codemode::subprocess::run_worker());
-        return ExitCode::SUCCESS;
-    }
-
     let cli = Cli::parse();
     // A current-thread runtime + LocalSet: the MCP server transport uses
     // `spawn_local` (rmcp's `local` feature), so it must run on a LocalSet.
@@ -86,7 +73,22 @@ fn build_runtime() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|e| format!("could not start the async runtime: {e}"))
 }
 
-async fn build_code_mode(config: Option<PathBuf>) -> Result<CodeMode, String> {
+async fn build_code_mode(config: Option<PathBuf>, serving: bool) -> Result<CodeMode, String> {
+    // `serve` executes model-written code in-process. Boa bounds loops, recursion,
+    // nesting (the parser), output, and tool-call count, but a deliberately hostile
+    // program (catastrophic regex backtracking or a huge synchronous allocation) is
+    // synchronous native work that can't be preempted in-process and can hang or
+    // exhaust memory (see docs/security.md). So the server is meant for trusted or
+    // steered model input, not arbitrary untrusted callers; say so once at startup.
+    // (`list_tools` runs no code, so it skips this.)
+    if serving {
+        eprintln!(
+            "warning: this server executes model-written code in-process. It is safe for trusted \
+             or steered input; a deliberately hostile program (catastrophic regex, a huge \
+             allocation) can still hang or exhaust memory. Do not expose it to untrusted callers."
+        );
+    }
+
     let mut builder = CodeMode::builder();
     if let Some(path) = config {
         if path
@@ -113,7 +115,7 @@ async fn run(cli: Cli) -> ExitCode {
 }
 
 async fn serve(config: Option<PathBuf>) -> ExitCode {
-    let cm = match build_code_mode(config).await {
+    let cm = match build_code_mode(config, true).await {
         Ok(cm) => Arc::new(cm),
         Err(e) => {
             eprintln!("error: {e}");
@@ -149,7 +151,7 @@ async fn serve(config: Option<PathBuf>) -> ExitCode {
 }
 
 async fn list_tools(config: Option<PathBuf>) -> ExitCode {
-    let cm = match build_code_mode(config).await {
+    let cm = match build_code_mode(config, false).await {
         Ok(cm) => cm,
         Err(e) => {
             eprintln!("error: {e}");

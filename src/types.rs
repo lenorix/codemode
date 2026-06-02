@@ -83,7 +83,9 @@ pub struct Limits {
     pub max_stack_size: usize,
     /// Maximum number of tool calls one execution may make.
     pub max_tool_calls: u32,
-    /// Maximum serialized size of a tool result or the final result.
+    /// Maximum serialized size of a tool result or the final result. Also the
+    /// byte budget for the captured logs and the cap on a model-facing error
+    /// message, so no single output channel can flood the model.
     pub max_output_bytes: usize,
     /// Wall-clock timeout for a single tool call (independent of `timeout`).
     pub per_call_timeout: Duration,
@@ -164,12 +166,9 @@ pub(crate) fn serialized_within(value: &serde_json::Value, max: usize) -> bool {
 /// such conversions comfortably within the stack. Real JSON rarely nests past a
 /// few dozen levels.
 ///
-/// Kept below `serde_json`'s default 128-level recursion limit so a value the
-/// bridge accepts always survives a re-parse on the wire: the subprocess worker
-/// deserializes each reply with `serde_json` (one level of which is the protocol
-/// envelope), so a result the in-process backend accepts must also parse there.
-/// This makes both backends reject over-deep results identically (a clean depth
-/// error) instead of one of them hanging on a reply that won't parse.
+/// Also kept below `serde_json`'s own default 128-level recursion limit, so any
+/// value the bridge accepts also round-trips through `serde_json` without hitting
+/// that limit. 120 leaves headroom for both.
 pub(crate) const MAX_JSON_DEPTH: usize = 120;
 
 /// True if `value` nests no deeper than `max`, checked iteratively (so the check

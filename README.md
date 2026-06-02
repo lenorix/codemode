@@ -39,10 +39,12 @@ let cm = Arc::new(
 let agent = client.agent(model).preamble("…").code_mode(&cm).build();
 ```
 
-> Expose only the tools you trust the model to compose: the sandbox isolates compute, not capability,
-> so injected code can chain any tools you allow (a read tool plus a write/send tool can exfiltrate).
-> Keep the allowlist least-privilege. For untrusted/prompt-injected input, prefer the `subprocess`
-> runtime for hard OS isolation. See [security](docs/security.md).
+> Expose only the tools you trust the model to compose: isolating compute is not the boundary, the
+> exposed tools are, so the model's code can chain any tools you allow (a read tool plus a write/send
+> tool can exfiltrate). Keep the allowlist least-privilege. codemode runs the model's code in-process
+> and is meant for trusted or steered input; if a host may feed untrusted or prompt-injected input,
+> isolate the whole process at the OS level yourself (a container with cgroup CPU and memory limits).
+> See [security](docs/security.md).
 
 As a **standalone MCP server** any host can configure:
 

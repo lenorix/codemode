@@ -138,6 +138,14 @@ async fn run_inner(
     bridge: Bridge,
     limits: &Limits,
 ) -> (Result<serde_json::Value, ExecError>, Vec<String>) {
+    // Bound the source before parsing it. `boa_parser` has no recursion limit, so
+    // deeply nested/recursive source would overflow this thread's stack and abort
+    // the process. Capping the source size relative to the (roomy) island stack
+    // makes that overflow unreachable for any accepted input (see
+    // `check_source_size`). Runs no JS.
+    if let Err(e) = check_source_size(source) {
+        return (Err(e), Vec::new());
+    }
     let loader = Rc::new(ServerModuleLoader::new(servers));
     let queue = Rc::new(Queue::default());
     let mut context = match ContextBuilder::new()
@@ -146,7 +154,7 @@ async fn run_inner(
         .build()
     {
         Ok(context) => context,
-        Err(e) => return (Err(js(e)), Vec::new()),
+        Err(e) => return (Err(js(e, limits.max_output_bytes)), Vec::new()),
     };
 
     {
@@ -157,7 +165,7 @@ async fn run_inner(
     }
 
     if let Err(e) = install_globals(&mut context) {
-        return (Err(js(e)), Vec::new());
+        return (Err(js(e, limits.max_output_bytes)), Vec::new());
     }
     context.insert_data(RunState {
         bridge,
@@ -166,14 +174,14 @@ async fn run_inner(
     });
 
     let result = async {
-        let module =
-            Module::parse(Source::from_bytes(source.as_bytes()), None, &mut context).map_err(js)?;
+        let module = Module::parse(Source::from_bytes(source.as_bytes()), None, &mut context)
+            .map_err(|e| js(e, limits.max_output_bytes))?;
 
         // Boa panics when a runtime limit (loop / recursion / stack) fires during
         // *module* evaluation, because it can't turn that error into a promise
         // rejection reason. We catch that panic and return a clean Limit error;
         // the context is fresh per run and dropped right after, so a poisoned
-        // engine state can't leak. (The real fix is subprocess isolation; see docs.)
+        // engine state can't leak.
         let eval = AssertUnwindSafe(async {
             let promise = module.load_link_evaluate(&mut context);
             queue
@@ -193,7 +201,7 @@ async fn run_inner(
                             .to_string(),
                 });
             }
-            Ok(Ok(Err(err))) => return Err(classify(err.to_string())),
+            Ok(Ok(Err(err))) => return Err(classify(err.to_string(), limits.max_output_bytes)),
             Ok(Ok(Ok(promise))) => promise,
         };
 
@@ -207,7 +215,10 @@ async fn run_inner(
             // `Symbol.toPrimitive` here, unbounded past the timeout (the same
             // post-deadline hazard `result_convertible` guards on the fulfilled
             // path). `render_rejection` reads stored properties only.
-            PromiseState::Rejected(err) => Err(classify(render_rejection(&err, &mut context))),
+            PromiseState::Rejected(err) => Err(classify(
+                render_rejection(&err, &mut context),
+                limits.max_output_bytes,
+            )),
             PromiseState::Pending => Err(ExecError::Exception {
                 message: "module did not finish executing".to_string(),
             }),
@@ -224,9 +235,42 @@ async fn run_inner(
     (result, logs)
 }
 
-fn js(err: impl ToString) -> ExecError {
+fn js(err: impl ToString, max: usize) -> ExecError {
     ExecError::Exception {
-        message: err.to_string(),
+        message: cap_message(err.to_string(), max),
+    }
+}
+
+/// Maximum source we'll hand the parser. This is the anti-abort guard for the
+/// parser stack overflow, and it works by being calibrated against the parse
+/// thread's stack rather than by inspecting the source. `boa_parser` is recursive
+/// descent with no depth limit, so deeply nested or right-recursive source
+/// (nested brackets, long `?:` / `=` / `**` / `new` chains) recurses one native
+/// frame per source token and would overflow the stack and *abort* the process
+/// during `Module::parse` (before evaluation, uncatchable by `catch_unwind`). The
+/// densest case is a run of open brackets: one frame, about 20 KiB of stack, per
+/// source byte. So if the source is no larger than `island_stack / 20 KiB`, even
+/// an all-brackets source can't drive the parser past the stack: the overflow
+/// becomes unreachable for *any* input within the cap, with no need to parse or
+/// scan it (which we proved can't be done soundly).
+///
+/// The pairing is the invariant: this cap times ~20 KiB must stay safely under
+/// [`crate::CodeMode`]'s island stack (8 KiB x 20 KiB = 160 MiB, comfortably under
+/// the 256 MiB stack). Raise them together if a larger source is ever needed. The
+/// parse runs on the single island thread, so it's one stack and there's no
+/// concurrency multiplier on the worst-case transient use. Real model-written
+/// orchestration code is far under 8 KiB.
+const MAX_SOURCE_BYTES: usize = 8 * 1024;
+
+/// Refuse a source larger than [`MAX_SOURCE_BYTES`] before we parse it, so the
+/// parser can't be driven to a stack-overflow abort (see the constant's note).
+fn check_source_size(source: &str) -> Result<(), ExecError> {
+    if source.len() > MAX_SOURCE_BYTES {
+        Err(ExecError::Limit {
+            what: format!("source is larger than {MAX_SOURCE_BYTES} bytes"),
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -242,7 +286,7 @@ fn exported_value(
     let default = module
         .namespace(context)
         .get(js_string!("default"), context)
-        .map_err(js)?;
+        .map_err(|e| js(e, max_output_bytes))?;
     if default.is_undefined() {
         return Err(ExecError::Exception {
             message: "no value was exported: assign your answer with \
@@ -259,7 +303,7 @@ fn exported_value(
     result_convertible(&default, context, MAX_RESULT_DEPTH, max_output_bytes)?;
     let value = default
         .to_json(context)
-        .map_err(js)?
+        .map_err(|e| js(e, max_output_bytes))?
         .unwrap_or(serde_json::Value::Null);
     check_output_size(&value, max_output_bytes)?;
     Ok(value)
@@ -300,13 +344,16 @@ const MAX_RESULT_DEPTH: usize = crate::types::MAX_JSON_DEPTH;
 /// It's a depth-first walk whose explicit stack holds only the *current path*
 /// (one frame per level), so the stack height equals the current depth and a
 /// wide level can never inflate it. Every node is visited and there's no
-/// early-accept, so a deep branch hidden behind wide padding can't slip past.
+/// early-accept by shape, so a deep branch hidden behind wide padding can't slip
+/// past. The number of visits is itself capped at `max_array_len`: a value that
+/// fans out past that (a DAG of shared sub-objects, which `to_json` re-expands
+/// once per reference) can't fit the output cap anyway, and the cap keeps both
+/// this walk and the `to_json` that follows from spinning on it.
 ///
-/// Best-effort, not a hard guarantee: a structure deep enough can still overflow
-/// Boa's GC when the context drops, and other hostile compute (ReDoS, giant
-/// allocations) isn't covered. It cleanly handles the realistic cases; the real
-/// containment for deliberately hostile code is the subprocess runtime (see
-/// docs/security.md).
+/// Best-effort, not a hard guarantee: other synchronous hostile compute (ReDoS,
+/// a single huge allocation) isn't covered and can't be bounded in-process. It
+/// cleanly handles the realistic cases; isolating deliberately hostile code is
+/// the host's responsibility (see docs/security.md).
 fn result_convertible(
     value: &JsValue,
     context: &mut Context,
@@ -356,6 +403,16 @@ fn result_convertible(
     let root_keys = keys(&root, context);
     // Frame = (object, its keys, index of the next key to visit).
     let mut stack: Vec<(JsObject, Vec<PropertyKey>, usize)> = vec![(root, root_keys, 0)];
+    // Bound the total work, not just the depth. `to_json` expands a shared
+    // sub-object once per reference (its cycle guard is path-local), so a DAG
+    // like `for (...) x = { l: x, r: x }` stays shallow yet serializes to
+    // exponentially many elements; this walk mirrors that expansion, so the same
+    // shape would spin here too. Both run after the wall-clock deadline on the
+    // shared island thread, so an unbounded walk would hang every concurrent
+    // execution. A value that serializes within the output cap emits at most
+    // `max_array_len` elements (each is at least one byte), so a higher count
+    // means the result is too large regardless; reject it as the size cap would.
+    let mut visited = 0usize;
     loop {
         let Some(top) = stack.last() else {
             return Ok(());
@@ -363,6 +420,10 @@ fn result_convertible(
         if top.2 >= top.1.len() {
             stack.pop();
             continue;
+        }
+        visited += 1;
+        if visited > max_array_len {
+            return Err(ExecError::OutputTooLarge);
         }
         // The child about to be inspected sits at depth `stack.len()`.
         if stack.len() > max_depth {
@@ -390,7 +451,10 @@ fn result_convertible(
 /// Map a JS error to an execution error, recognising the structural limits.
 /// Boa's messages: "Maximum loop iteration limit N exceeded",
 /// "exceeded maximum number of recursive calls", "exceeded maximum call stack length".
-fn classify(message: String) -> ExecError {
+/// `max` bounds the stored message, so a thrown error can't smuggle output past
+/// the cap that bounds `result` and `logs` (see [`cap_message`]).
+fn classify(message: String, max: usize) -> ExecError {
+    let message = cap_message(message, max);
     let lower = message.to_lowercase();
     let is_limit = lower.contains("loop iteration limit")
         || lower.contains("exceeded maximum number of recursive calls")
@@ -400,6 +464,24 @@ fn classify(message: String) -> ExecError {
     } else {
         ExecError::Exception { message }
     }
+}
+
+/// Cap a model-facing error message to roughly `max` bytes (cutting on a char
+/// boundary). `result` and `logs` are already byte-capped; without this a thrown
+/// `Error` with a multi-megabyte `message`, or a giant primitive throw, would
+/// flow into the `Outcome` error uncapped and flood the model just the same.
+fn cap_message(message: String, max: usize) -> String {
+    if message.len() <= max {
+        return message;
+    }
+    let mut end = max;
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = message;
+    out.truncate(end);
+    out.push_str(" [error truncated]");
+    out
 }
 
 /// Render a promise rejection reason to a string WITHOUT invoking user code.
@@ -1045,6 +1127,26 @@ mod tests {
     }
 
     #[test]
+    fn bridge_global_is_reachable_but_not_enumerable() {
+        // The bridge must stay reachable (the generated modules call it) yet not
+        // show up in `Object.keys(globalThis)`, so model code enumerating the
+        // globals can't discover the door. Pins a documented invariant.
+        let outcome = run(
+            "export default {\n\
+               reachable: typeof __codemodeCall === 'function',\n\
+               enumerable: Object.keys(globalThis).includes('__codemodeCall'),\n\
+             };",
+            vec![],
+            echo_bridge(),
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(
+            outcome.result,
+            json!({ "reachable": true, "enumerable": false })
+        );
+    }
+
+    #[test]
     fn frees_memory_between_runs() {
         // A run that allocates a large array completes, and the next run is
         // unaffected: the per-run context (and its heap) was dropped.
@@ -1086,6 +1188,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversized_source() {
+        let src = "a".repeat(MAX_SOURCE_BYTES + 1);
+        let outcome = run(&src, vec![], echo_bridge());
+        assert!(
+            matches!(outcome.error, Some(ExecError::Limit { .. })),
+            "expected a Limit error, got {:?}",
+            outcome.error
+        );
+    }
+
+    #[test]
     fn recursion_limit_trips() {
         let limits = Limits {
             max_recursion_depth: 20,
@@ -1117,6 +1230,49 @@ mod tests {
             limits,
         );
         assert!(matches!(outcome.error, Some(ExecError::OutputTooLarge)));
+    }
+
+    #[test]
+    fn caps_oversized_exception_message() {
+        // `result` and `logs` are byte-capped; a thrown error's message must be
+        // too, or untrusted code floods the model with `throw new Error(huge)`.
+        let limits = Limits {
+            max_output_bytes: 256,
+            ..Limits::default()
+        };
+        let outcome = run_with(
+            "throw new Error('x'.repeat(1000000));",
+            vec![],
+            echo_bridge(),
+            limits,
+        );
+        let Some(ExecError::Exception { message }) = outcome.error else {
+            panic!("expected an exception, got {:?}", outcome.error);
+        };
+        assert!(
+            message.len() < 512,
+            "exception message not capped: {} bytes",
+            message.len()
+        );
+    }
+
+    #[test]
+    fn caps_oversized_primitive_throw() {
+        // The same cap must apply to a non-Error throw (a giant primitive string),
+        // which renders through `to_string` rather than the stored `message`.
+        let limits = Limits {
+            max_output_bytes: 256,
+            ..Limits::default()
+        };
+        let outcome = run_with("throw 'x'.repeat(1000000);", vec![], echo_bridge(), limits);
+        let Some(ExecError::Exception { message }) = outcome.error else {
+            panic!("expected an exception, got {:?}", outcome.error);
+        };
+        assert!(
+            message.len() < 512,
+            "primitive throw message not capped: {} bytes",
+            message.len()
+        );
     }
 
     #[test]
@@ -1168,8 +1324,7 @@ mod tests {
         // A deeply nested export would overflow the native stack during `to_json`
         // and *abort* the process; the depth guard turns it into a clean Limit.
         // (1000 is past the 256 cap but shallow enough that the structure's own
-        // drop is safe; extreme depth is only fully contained by the subprocess
-        // runtime, see docs/security.md.)
+        // drop is safe.)
         let outcome = run(
             "let a = []; for (let i = 0; i < 1000; i++) a = [a]; export default a;",
             vec![],
@@ -1200,6 +1355,56 @@ mod tests {
             matches!(outcome.error, Some(ExecError::Limit { .. })),
             "expected a Limit error, got {:?}",
             outcome.error
+        );
+    }
+
+    #[test]
+    fn rejects_dag_shaped_results_without_hanging() {
+        // A shallow DAG of shared sub-objects: only ~60 objects exist, but every
+        // level points at the same child twice, so the graph has 2^60 distinct
+        // root-to-leaf paths. `to_json` re-expands a shared node once per
+        // reference, so without a work cap both the convertibility probe and
+        // `to_json` would walk exponentially many paths after the deadline and
+        // hang the island. The visit cap must turn this into a clean, fast error.
+        let started = std::time::Instant::now();
+        let outcome = run(
+            "let x = { a: 1 };\n\
+             for (let i = 0; i < 60; i++) x = { l: x, r: x };\n\
+             export default x;",
+            vec![],
+            echo_bridge(),
+        );
+        assert!(
+            matches!(outcome.error, Some(ExecError::OutputTooLarge)),
+            "expected OutputTooLarge, got {:?}",
+            outcome.error
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "DAG rejection should be fast, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn accepts_benign_shared_subobjects() {
+        // Plain (non-exponential) sharing is legitimate and must still convert:
+        // `to_json` serializes the shared object in each place, well within the
+        // output cap, so the visit cap must not reject it.
+        let outcome = run(
+            "const shared = { x: 1 };\n\
+             export default { a: shared, b: shared, c: shared };",
+            vec![],
+            echo_bridge(),
+        );
+        assert!(
+            outcome.error.is_none(),
+            "unexpected error: {:?}",
+            outcome.error
+        );
+        assert_eq!(
+            outcome.result,
+            json!({ "a": { "x": 1 }, "b": { "x": 1 }, "c": { "x": 1 } })
         );
     }
 
