@@ -81,6 +81,11 @@ pub struct Limits {
     pub max_recursion_depth: usize,
     /// Max VM stack depth, for backends that bound recursion via a stack limit.
     pub max_stack_size: usize,
+    /// Max stack frames captured when building a thrown exception's backtrace,
+    /// for backends that bound that cost. Building an unbounded backtrace on
+    /// every throw from deeply recursive (but otherwise within-limits) code
+    /// costs CPU and allocation independent of `max_recursion_depth`.
+    pub max_backtrace_frames: usize,
     /// Maximum number of tool calls one execution may make.
     pub max_tool_calls: u32,
     /// Maximum serialized size of a tool result or the final result. Also the
@@ -98,6 +103,7 @@ impl Default for Limits {
             max_loop_iterations: 10_000_000,
             max_recursion_depth: 400,
             max_stack_size: 1024 * 10, // a typical engine default
+            max_backtrace_frames: 50, // matches the underlying engine's own default
             max_tool_calls: 50,
             max_output_bytes: 1_000_000,
             per_call_timeout: Duration::from_secs(30),

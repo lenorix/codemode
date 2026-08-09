@@ -128,6 +128,7 @@ struct TomlRuntime {
     max_loop_iterations: Option<u64>,
     max_recursion_depth: Option<usize>,
     max_stack_size: Option<usize>,
+    max_backtrace_frames: Option<usize>,
     max_tool_calls: Option<u32>,
     max_output_bytes: Option<usize>,
     per_call_timeout_ms: Option<u64>,
@@ -159,6 +160,9 @@ impl From<TomlConfig> for Config {
             }
             if let Some(v) = rt.max_stack_size {
                 limits.max_stack_size = v;
+            }
+            if let Some(v) = rt.max_backtrace_frames {
+                limits.max_backtrace_frames = v;
             }
             if let Some(v) = rt.max_tool_calls {
                 limits.max_tool_calls = v;
@@ -205,12 +209,14 @@ mod tests {
             [runtime]
             timeout_ms = 2000
             max_tool_calls = 10
+            max_backtrace_frames = 5
         "#;
         let cfg: Config = toml::from_str::<TomlConfig>(toml).unwrap().into();
         assert_eq!(cfg.servers.len(), 1);
         let s = &cfg.servers[0];
         assert_eq!(s.name, "gd");
         assert_eq!(s.command, "npx");
+        assert_eq!(cfg.limits.max_backtrace_frames, 5);
         assert_eq!(s.allow.as_deref(), Some(&["getSheet".to_string()][..]));
         assert_eq!(cfg.limits.timeout, std::time::Duration::from_millis(2000));
         assert_eq!(cfg.limits.max_tool_calls, 10);

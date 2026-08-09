@@ -162,6 +162,7 @@ async fn run_inner(
         rl.set_loop_iteration_limit(limits.max_loop_iterations);
         rl.set_recursion_limit(limits.max_recursion_depth);
         rl.set_stack_size_limit(limits.max_stack_size);
+        rl.set_backtrace_limit(limits.max_backtrace_frames);
     }
 
     if let Err(e) = install_globals(&mut context) {
@@ -1215,6 +1216,26 @@ mod tests {
             "expected a Limit error, got {:?}",
             outcome.error
         );
+    }
+
+    #[test]
+    fn low_backtrace_limit_does_not_disrupt_normal_exceptions() {
+        // A tight backtrace_limit only bounds how much of the call stack Boa
+        // records when building a thrown exception; it must not change whether
+        // the throw is caught or what message surfaces.
+        let limits = Limits {
+            max_backtrace_frames: 1,
+            ..Limits::default()
+        };
+        let outcome = run_with(
+            "function a(){ b(); } function b(){ throw new Error('boom'); } \
+             try { a(); } catch (e) { } export default 1;",
+            vec![],
+            echo_bridge(),
+            limits,
+        );
+        assert!(outcome.error.is_none());
+        assert_eq!(outcome.result, json!(1));
     }
 
     #[test]
