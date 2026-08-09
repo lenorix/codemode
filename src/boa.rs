@@ -1223,6 +1223,16 @@ mod tests {
         // A tight backtrace_limit only bounds how much of the call stack Boa
         // records when building a thrown exception; it must not change whether
         // the throw is caught or what message surfaces.
+        //
+        // This is a smoke test, not a wiring assertion, because the limit's
+        // effect is not observable from here in boa 0.21.1: `Error.stack` does
+        // not exist (`typeof e.stack` is `"undefined"`), `JsError::backtrace` is
+        // `pub(crate)`, and although `Display for JsError` does append the
+        // frames, a thrown exception reaches us through `render_rejection`,
+        // which reads stored properties instead of `to_string` (deliberately, so
+        // a hostile `toString` can't run past the deadline). The limit still
+        // bounds the frames Boa walks and allocates on every throw, which is why
+        // it is set; assert what is observable and leave the rest documented.
         let limits = Limits {
             max_backtrace_frames: 1,
             ..Limits::default()
